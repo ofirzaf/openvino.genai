@@ -4,7 +4,9 @@
 #include "eagle3_model_transforms.hpp"
 
 #include <fstream>
+#include <functional>
 #include <optional>
+#include <unordered_map>
 #include <nlohmann/json.hpp>
 
 #include "json_utils.hpp"

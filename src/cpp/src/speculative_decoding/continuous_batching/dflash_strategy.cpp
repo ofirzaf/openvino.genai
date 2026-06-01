@@ -234,6 +234,7 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
         .run_on_model(main_model);
     utils::apply_gather_before_matmul_transformation(main_model);
     utils::dflash::expose_target_hidden_states(main_model, m_rt_info.target_layer_ids);
+    utils::dflash::move_hidden_state_projection_to_target(draft_model_desc.model, main_model);
     validate_target_has_no_unmanaged_state(main_model);
 
     m_tokenizer = main_model_desc.tokenizer;

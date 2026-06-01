@@ -9,7 +9,10 @@
 #include <vector>
 
 #include "openvino/op/add.hpp"
+#include "openvino/op/concat.hpp"
 #include "openvino/op/constant.hpp"
+#include "openvino/op/matmul.hpp"
+#include "openvino/op/multiply.hpp"
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/reshape.hpp"
 #include "openvino/op/result.hpp"
@@ -88,6 +91,61 @@ size_t count_outputs_with_name(const std::shared_ptr<ov::Model>& model, const st
         }
     }
     return count;
+}
+
+std::shared_ptr<ov::Model> make_target_hidden_export_model() {
+    auto first = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, 2});
+    first->set_friendly_name("target_layer_0");
+    auto second = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, 2});
+    second->set_friendly_name("target_layer_1");
+    auto third = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{-1, 1, 2});
+    third->set_friendly_name("target_layer_2");
+
+    auto concat = std::make_shared<ov::op::v0::Concat>(
+        ov::OutputVector{first->output(0), second->output(0), third->output(0)},
+        -1);
+    concat->set_friendly_name("dflash_hidden_states_concat");
+    auto result = std::make_shared<ov::op::v0::Result>(concat);
+    result->set_friendly_name("last_hidden_state");
+    result->output(0).set_names({"last_hidden_state"});
+
+    return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{first, second, third});
+}
+
+std::shared_ptr<ov::Model> make_dflash_draft_projection_model() {
+    auto hidden_states = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{1, -1, 6});
+    hidden_states->set_friendly_name("hidden_states");
+    hidden_states->output(0).set_names({"hidden_states"});
+    auto noise_states = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{1, -1, 2});
+    noise_states->set_friendly_name("noise_states");
+
+    auto fc_weights = ov::op::v0::Constant::create(ov::element::f32,
+                                                   ov::Shape{2, 6},
+                                                   std::vector<float>{1, 0, 0, 0, 0, 0,
+                                                                      0, 1, 0, 0, 0, 0});
+    auto fc = std::make_shared<ov::op::v0::MatMul>(hidden_states, fc_weights, false, true);
+    fc->set_friendly_name("fc/MatMul");
+    auto norm_scale = ov::op::v0::Constant::create(ov::element::f32,
+                                                   ov::Shape{1, 1, 2},
+                                                   std::vector<float>{1.0f, 1.0f});
+    auto hidden_norm = std::make_shared<ov::op::v1::Multiply>(fc, norm_scale);
+    hidden_norm->set_friendly_name("hidden_norm/Multiply");
+
+    auto draft_consumer = std::make_shared<ov::op::v1::Add>(hidden_norm, noise_states);
+    draft_consumer->set_friendly_name("draft_consumer");
+    auto result = std::make_shared<ov::op::v0::Result>(draft_consumer);
+    result->set_friendly_name("draft_result");
+
+    return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{hidden_states, noise_states});
+}
+
+ov::PartialShape input_shape_by_name(const std::shared_ptr<ov::Model>& model, const std::string& name) {
+    for (const auto& input : model->inputs()) {
+        if (input.get_names().count(name) != 0) {
+            return input.get_partial_shape();
+        }
+    }
+    OPENVINO_THROW("Missing model input: ", name);
 }
 
 }  // namespace
@@ -217,6 +275,31 @@ TEST(DFlashModelTransforms, ThrowsForIncompatibleDraftHiddenStatesInput) {
     auto model = make_dflash_draft_hidden_states_model(ov::PartialShape({2, 2, 4}));
 
     EXPECT_THROW(ov::genai::utils::dflash::reshape_draft_hidden_states_input_for_cb(model), ov::Exception);
+}
+
+TEST(DFlashCBModelTransforms, MovesHiddenProjectionToTargetAndCompactsDraftInput) {
+    auto target_model = make_target_hidden_export_model();
+    auto draft_model = make_dflash_draft_projection_model();
+
+    ov::genai::utils::dflash::move_hidden_state_projection_to_target(draft_model, target_model);
+
+    ASSERT_TRUE(target_model->get_results().front()->input_value(0).get_partial_shape().compatible(
+        ov::PartialShape{-1, 1, 2}));
+    ASSERT_TRUE(input_shape_by_name(draft_model, "hidden_states").compatible(ov::PartialShape{1, -1, 2}));
+
+    for (const auto& node : target_model->get_ordered_ops()) {
+        ASSERT_NE(node->get_friendly_name(), "dflash_hidden_states_cb_to_projection_layout");
+        ASSERT_NE(node->get_friendly_name(), "dflash_projected_hidden_states_projection_to_cb_layout");
+    }
+
+    for (const auto& node : draft_model->get_ordered_ops()) {
+        auto matmul = ov::as_type_ptr<ov::op::v0::MatMul>(node);
+        ASSERT_FALSE(matmul && matmul->get_friendly_name().find("fc") != std::string::npos);
+    }
+
+    ov::genai::utils::dflash::reshape_draft_hidden_states_input_for_cb(draft_model);
+
+    ASSERT_TRUE(input_shape_by_name(draft_model, "hidden_states").compatible(ov::PartialShape{-1, 1, 2}));
 }
 
 TEST(DFlashCBHiddenState, TruncatesRejectedTail) {

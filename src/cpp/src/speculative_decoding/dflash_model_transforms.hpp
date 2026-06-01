@@ -45,6 +45,18 @@ DFlashRTInfo extract_dflash_info_from_config(ov::AnyMap& config);
 void expose_target_hidden_states(std::shared_ptr<ov::Model>& model, const std::vector<int32_t>& target_layer_ids);
 
 /**
+ * @brief Moves DFlash target-hidden projection from draft model to target model.
+ *
+ * DFlash exports the draft graph with a `hidden_states -> fc -> hidden_norm`
+ * projection. Continuous batching stores target hidden states in token-major
+ * layout, so this transform applies the draft projection to the target's
+ * `last_hidden_state` result and rewires the draft to accept the projected
+ * hidden stream directly.
+ */
+void move_hidden_state_projection_to_target(const std::shared_ptr<ov::Model>& draft_model,
+                                            const std::shared_ptr<ov::Model>& target_model);
+
+/**
  * @brief Makes DFlash draft accept CB-native hidden states externally.
  *
  * DFlash draft graphs are exported with hidden_states shaped [1, seq_len, hidden],
