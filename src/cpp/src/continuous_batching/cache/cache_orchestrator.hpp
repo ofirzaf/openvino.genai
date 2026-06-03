@@ -204,9 +204,18 @@ public:
             [&seq_group, num_tokens](const auto& pair) { return pair.second->can_allocate_tokens(seq_group, num_tokens); });
     }
 
-    std::map<CacheType, std::map<size_t, std::list<size_t>>> append_slots(SequenceGroup::Ptr seq_group) {
+    // NOTE: skip_linear_attention is a group-level signal used when the scheduler
+    // reserves per-sequence linear-attention speculative checkpoint blocks instead
+    // of doing the normal LA append. This assumes all running sequences in the group
+    // use compatible checkpoint counts; multi-sequence speculative methods with
+    // per-sequence num_assistant_tokens may need per-sequence LA append intent.
+    std::map<CacheType, std::map<size_t, std::list<size_t>>> append_slots(SequenceGroup::Ptr seq_group,
+                                                                          bool skip_linear_attention = false) {
         std::map<CacheType, std::map<size_t, std::list<size_t>>> per_type;
         for (auto& [type, block_mgr] : m_block_managers) {
+            if (skip_linear_attention && type == CacheType::LINEAR_ATTENTION_CACHE) {
+                continue;
+            }
             auto copy_map = block_mgr->append_slots(seq_group);
             queue_linear_attention_initial_state_zero(type, *block_mgr, seq_group);
             if (!copy_map.empty()) {
@@ -216,9 +225,14 @@ public:
         return per_type;
     }
 
-    bool can_append_slots(SequenceGroup::CPtr seq_group) const {
+    bool can_append_slots(SequenceGroup::CPtr seq_group, bool skip_linear_attention = false) const {
         return std::all_of(m_block_managers.begin(), m_block_managers.end(),
-            [&seq_group](const auto& pair) { return pair.second->can_append_slots(seq_group); });
+            [&seq_group, skip_linear_attention](const auto& pair) {
+                if (skip_linear_attention && pair.first == CacheType::LINEAR_ATTENTION_CACHE) {
+                    return true;
+                }
+                return pair.second->can_append_slots(seq_group);
+            });
     }
 
     /**
@@ -651,22 +665,56 @@ public:
         return m_block_managers.at(CacheType::LINEAR_ATTENTION_CACHE)->get_block_tables(seq_id)[0];
     }
 
-    std::vector<int> reserve_linear_attention_temporary_blocks(uint64_t seq_id, size_t num_blocks) {
+    bool can_reserve_linear_attention_speculative_blocks(size_t num_blocks) const {
+        if (!has_linear_attention_cache()) {
+            return true;
+        }
+        return m_block_managers.at(CacheType::LINEAR_ATTENTION_CACHE)->can_reserve_speculative_blocks(num_blocks);
+    }
+
+    bool grow_linear_attention_blocks_if_needed(size_t num_blocks) {
+        if (!has_linear_attention_cache()) {
+            return false;
+        }
+        auto& block_mgr = *m_block_managers.at(CacheType::LINEAR_ATTENTION_CACHE);
+        if (block_mgr.can_reserve_speculative_blocks(num_blocks)) {
+            return false;
+        }
+
+        const size_t available_blocks = block_mgr.num_free_blocks();
+        OPENVINO_ASSERT(num_blocks > available_blocks,
+                        "Linear attention speculative reservation mismatch: requested ",
+                        num_blocks,
+                        " blocks, available ",
+                        available_blocks);
+        block_mgr.increase_kv_blocks_number(
+            block_mgr.get_total_number_of_kv_blocks() + num_blocks - available_blocks);
+        return true;
+    }
+
+    std::vector<int> reserve_linear_attention_speculative_blocks(uint64_t seq_id,
+                                                                 size_t num_blocks,
+                                                                 size_t base_processed_tokens,
+                                                                 size_t cache_interval) {
         OPENVINO_ASSERT(has_linear_attention_cache(), "No linear attention cache registered");
         OPENVINO_ASSERT(num_blocks > 0, "Cannot reserve zero linear attention checkpoint blocks");
-        return m_block_managers.at(CacheType::LINEAR_ATTENTION_CACHE)->reserve_temporary_blocks(seq_id, num_blocks);
+        return m_block_managers.at(CacheType::LINEAR_ATTENTION_CACHE)
+            ->reserve_speculative_blocks(seq_id, num_blocks, base_processed_tokens, cache_interval);
     }
 
-    void promote_linear_attention_temporary_block(uint64_t seq_id, size_t checkpoint_slot) {
+    void commit_linear_attention_speculative_blocks(Sequence::Ptr sequence,
+                                                    size_t checkpoint_slot,
+                                                    size_t accepted_processed_tokens) {
         OPENVINO_ASSERT(has_linear_attention_cache(), "No linear attention cache registered");
-        m_block_managers.at(CacheType::LINEAR_ATTENTION_CACHE)->promote_temporary_block(seq_id, checkpoint_slot);
+        m_block_managers.at(CacheType::LINEAR_ATTENTION_CACHE)
+            ->commit_speculative_blocks(sequence, checkpoint_slot, accepted_processed_tokens);
     }
 
-    void release_linear_attention_temporary_blocks(uint64_t seq_id) {
+    void rollback_linear_attention_speculative_blocks(uint64_t seq_id) {
         if (!has_linear_attention_cache()) {
             return;
         }
-        m_block_managers.at(CacheType::LINEAR_ATTENTION_CACHE)->release_temporary_blocks(seq_id);
+        m_block_managers.at(CacheType::LINEAR_ATTENTION_CACHE)->rollback_speculative_blocks(seq_id);
     }
 
     /// @return Number of KV attention layers only (excluding other cache types).

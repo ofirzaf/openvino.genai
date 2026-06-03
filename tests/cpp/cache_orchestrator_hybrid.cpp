@@ -502,6 +502,33 @@ TEST(TestCacheOrchestratorHybrid, GrowFixedSize_OnlyAffectsFixed) {
     EXPECT_EQ(final_la_blocks, initial_la_blocks + 3);
 }
 
+TEST(TestCacheOrchestratorHybrid, GrowLinearAttentionBlocksIfNeededAddsOnlyMissingSpeculativeBlocks) {
+    auto orchestrator = create_hybrid_orchestrator(
+        /*num_kv_blocks=*/8,
+        /*num_la_blocks=*/1,
+        TEST_BLOCK_SIZE,
+        /*num_layers=*/1,
+        /*la_fixed_blocks_per_seq=*/1);
+
+    auto sequence_group = create_sequence_group(401);
+    auto sequence = sequence_group->get_running_sequences().front();
+    orchestrator->allocate_tokens(sequence, sequence_group, 1, sequence_group->get_prompt_len());
+
+    const auto& kv_bm = orchestrator->get_block_manager(CacheType::KV_CACHE);
+    const auto& la_bm = orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE);
+    const size_t initial_kv_blocks = kv_bm.get_total_number_of_kv_blocks();
+    const size_t initial_la_blocks = la_bm.get_total_number_of_kv_blocks();
+
+    EXPECT_FALSE(orchestrator->can_reserve_linear_attention_speculative_blocks(3));
+    EXPECT_TRUE(orchestrator->grow_linear_attention_blocks_if_needed(3));
+    EXPECT_EQ(kv_bm.get_total_number_of_kv_blocks(), initial_kv_blocks);
+    EXPECT_EQ(la_bm.get_total_number_of_kv_blocks(), initial_la_blocks + 3);
+    EXPECT_TRUE(orchestrator->can_reserve_linear_attention_speculative_blocks(3));
+    EXPECT_FALSE(orchestrator->grow_linear_attention_blocks_if_needed(3));
+
+    orchestrator->free_sequence(sequence->get_id());
+}
+
 /// @test EnsureSequenceTokenCapacity_SkipsFixed
 /// Verify that ensure_sequence_token_capacity() only affects variable-size cache types,
 /// not fixed-size types like LinearAttention.

@@ -186,17 +186,23 @@ public:
         m_linear_attention_checkpoint_counts[seq_id] = checkpoint_count;
     }
 
-    void promote_linear_attention_checkpoint(uint64_t seq_id, size_t checkpoint_slot) {
+    void promote_linear_attention_checkpoint(Sequence::Ptr sequence,
+                                             size_t checkpoint_slot,
+                                             size_t accepted_processed_tokens) {
+        OPENVINO_ASSERT(sequence, "Cannot promote linear attention checkpoint for null sequence");
+        const uint64_t seq_id = sequence->get_id();
         m_linear_attention_checkpoint_counts.erase(seq_id);
         if (!m_cache_orchestrator->has_linear_attention_cache()) {
             return;
         }
-        m_cache_orchestrator->promote_linear_attention_temporary_block(seq_id, checkpoint_slot);
+        m_cache_orchestrator->commit_linear_attention_speculative_blocks(sequence,
+                                                                         checkpoint_slot,
+                                                                         accepted_processed_tokens);
     }
 
     void release_linear_attention_checkpoints(uint64_t seq_id) {
         m_linear_attention_checkpoint_counts.erase(seq_id);
-        m_cache_orchestrator->release_linear_attention_temporary_blocks(seq_id);
+        m_cache_orchestrator->rollback_linear_attention_speculative_blocks(seq_id);
     }
 
     void free_blocks_from_sequence(size_t seq_id, const std::vector<std::set<size_t>>& per_layer_logical_block_indices_to_free, CacheType cache_type) {
@@ -279,11 +285,13 @@ private:
         return std::numeric_limits<size_t>::max();
     }
 
-    void _apply_preemption(size_t sequence_group_id, const std::vector<SequenceGroup::Ptr>& sequence_groups) {
+    void _apply_preemption(size_t sequence_group_id,
+                           const std::vector<SequenceGroup::Ptr>& sequence_groups,
+                           bool skip_linear_attention = false) {
         SequenceGroup::Ptr sequence_group = sequence_groups[sequence_group_id];
 
         // check whether current sequence requires a new slot / block
-        while (!m_cache_orchestrator->can_append_slots(sequence_group)) {
+        while (!m_cache_orchestrator->can_append_slots(sequence_group, skip_linear_attention)) {
             // let's run a sequence for eviction
             size_t evicted_sequence_group_id = _get_low_priority_sequence_group_id(sequence_groups);
 
@@ -400,23 +408,35 @@ private:
 
                 size_t num_scheduled_tokens_per_seq = std::min(available_tokens_per_seq_in_megabatch, num_available_tokens_per_seq);
                 sequence_group->schedule_tokens(num_scheduled_tokens_per_seq);
+                const bool skip_linear_attention_append = _uses_linear_attention_checkpoints(sequence_group);
 
-                while (!m_cache_orchestrator->can_append_slots(sequence_group)) {
+                while (!m_cache_orchestrator->can_append_slots(sequence_group, skip_linear_attention_append)) {
                     if (!_try_increase_cache(sequence_group)) {
                         break;
                     }
                 }
 
-                _apply_preemption(sequence_group_id, sequence_groups);
+                if (skip_linear_attention_append) {
+                    const size_t checkpoint_count = _linear_attention_checkpoint_count(sequence_group);
+                    if (!m_cache_orchestrator->can_reserve_linear_attention_speculative_blocks(checkpoint_count)) {
+                        m_cache_orchestrator->grow_linear_attention_blocks_if_needed(checkpoint_count);
+                    }
+                }
+
+                _apply_preemption(sequence_group_id, sequence_groups, skip_linear_attention_append);
 
                 // if we can't preemt any more sequences, clear scheduled tokens and move to next sequence
-                if (!m_cache_orchestrator->can_append_slots(sequence_group)) {
+                if (!m_cache_orchestrator->can_append_slots(sequence_group, skip_linear_attention_append) ||
+                    (skip_linear_attention_append &&
+                     !m_cache_orchestrator->can_reserve_linear_attention_speculative_blocks(
+                         _linear_attention_checkpoint_count(sequence_group)))) {
                     sequence_group->clear_scheduled_tokens();
                     continue;
                 }
 
                 // allocate new slots
-                std::map<CacheType, std::map<size_t, std::list<size_t>>> per_type_copy_map = m_cache_orchestrator->append_slots(sequence_group);
+                std::map<CacheType, std::map<size_t, std::list<size_t>>> per_type_copy_map =
+                    m_cache_orchestrator->append_slots(sequence_group, skip_linear_attention_append);
 
                 // add information to scheduler_output
                 {
@@ -633,19 +653,31 @@ private:
         paging_data.past_length = checked_size_to_int32(num_processed_tokens, "past length", seq_id);
         auto checkpoint_it = m_linear_attention_checkpoint_counts.find(seq_id);
         if (checkpoint_it != m_linear_attention_checkpoint_counts.end()) {
-            OPENVINO_ASSERT(!m_config.enable_prefix_caching,
-                            "Linear attention checkpoint paging currently supports fixed one-block state only");
             const size_t checkpoint_count = checkpoint_it->second;
             OPENVINO_ASSERT(checkpoint_count == num_scheduled_tokens,
                             "Linear attention checkpoint count must match scheduled tokens for sequence ", seq_id,
                             ": checkpoints ", checkpoint_count, ", scheduled tokens ", num_scheduled_tokens);
-            const int32_t committed_block_index = checked_block_index_to_int32(la_blocks[0]->get_index(), seq_id);
-            const auto temporary_block_indices =
-                m_cache_orchestrator->reserve_linear_attention_temporary_blocks(seq_id, checkpoint_count);
+            size_t cache_interval = 1;
+            size_t read_block_position = 0;
+            if (m_config.enable_prefix_caching) {
+                cache_interval = m_cache_orchestrator->get_block_size(CacheType::LINEAR_ATTENTION_CACHE);
+                OPENVINO_ASSERT(cache_interval > 0,
+                    "Internal error: linear attention cache interval must be greater than 0 when prefix caching is enabled");
+                read_block_position = num_processed_tokens == 0 ? 0 : (num_processed_tokens - 1) / cache_interval;
+            }
+            OPENVINO_ASSERT(read_block_position < la_blocks.size(),
+                            "Linear attention block table has no read block for sequence ", seq_id,
+                            ": position ", read_block_position, ", blocks ", la_blocks.size());
+            const int32_t committed_block_index = checked_block_index_to_int32(la_blocks[read_block_position]->get_index(), seq_id);
+            const auto speculative_block_indices =
+                m_cache_orchestrator->reserve_linear_attention_speculative_blocks(seq_id,
+                                                                                  checkpoint_count,
+                                                                                  num_processed_tokens,
+                                                                                  cache_interval);
 
-            paging_data.block_indices.reserve(1 + temporary_block_indices.size());
+            paging_data.block_indices.reserve(1 + speculative_block_indices.size());
             paging_data.block_indices.push_back(committed_block_index);
-            for (int block_index : temporary_block_indices) {
+            for (int block_index : speculative_block_indices) {
                 paging_data.block_indices.push_back(checked_block_index_to_int32(block_index, seq_id));
             }
             paging_data.cache_interval = 1;
@@ -701,6 +733,32 @@ private:
                         "Linear attention paging block index for sequence ", seq_id,
                         " exceeds int32_t maximum: ", block_index);
         return static_cast<int32_t>(block_index);
+    }
+
+    bool _uses_linear_attention_checkpoints(SequenceGroup::CPtr sequence_group) const {
+        if (!m_cache_orchestrator->has_linear_attention_cache()) {
+            return false;
+        }
+        for (const auto& seq : sequence_group->get_running_sequences()) {
+            if (m_linear_attention_checkpoint_counts.find(seq->get_id()) != m_linear_attention_checkpoint_counts.end()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    size_t _linear_attention_checkpoint_count(SequenceGroup::CPtr sequence_group) const {
+        size_t checkpoint_count = 0;
+        for (const auto& seq : sequence_group->get_running_sequences()) {
+            auto it = m_linear_attention_checkpoint_counts.find(seq->get_id());
+            if (it == m_linear_attention_checkpoint_counts.end()) {
+                continue;
+            }
+            OPENVINO_ASSERT(checkpoint_count == 0 || checkpoint_count == it->second,
+                            "Linear attention checkpoint counts differ within one sequence group");
+            checkpoint_count = it->second;
+        }
+        return checkpoint_count;
     }
 
     size_t _schedule_scores_to_aggregate(SequenceGroup::Ptr sequence_group) {

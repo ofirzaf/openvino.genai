@@ -371,11 +371,23 @@ reserve_linear_attention_checkpoints_for_next_step(uint64_t request_id, size_t c
 }
 
 void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::
-promote_linear_attention_checkpoint_for_sequence(uint64_t seq_id, size_t checkpoint_slot) {
+promote_linear_attention_checkpoint_for_sequence(uint64_t seq_id,
+                                                 size_t checkpoint_slot,
+                                                 size_t accepted_processed_tokens) {
     if (!m_scheduler || seq_id == std::numeric_limits<uint64_t>::max()) {
         return;
     }
-    m_scheduler->promote_linear_attention_checkpoint(seq_id, checkpoint_slot);
+    for (const auto& request : m_requests) {
+        for (const auto& sequence : request->get_running_sequences()) {
+            if (sequence->get_id() == seq_id) {
+                m_scheduler->promote_linear_attention_checkpoint(sequence,
+                                                                 checkpoint_slot,
+                                                                 accepted_processed_tokens);
+                return;
+            }
+        }
+    }
+    m_scheduler->release_linear_attention_checkpoints(seq_id);
 }
 
 void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::

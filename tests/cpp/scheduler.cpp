@@ -553,6 +553,43 @@ TEST(TestScheduler, hybrid_runtime_arrival_beyond_initial_fixed_capacity_schedul
     }
 }
 
+TEST(TestScheduler, hybrid_speculative_linear_attention_growth_adds_checkpoint_capacity) {
+    SchedulerConfig scheduler_config;
+    scheduler_config.max_num_batched_tokens = 8;
+    scheduler_config.num_kv_blocks = 8;
+    scheduler_config.cache_size = 0;
+    scheduler_config.num_linear_attention_blocks = 1;
+    scheduler_config.dynamic_split_fuse = true;
+    scheduler_config.max_num_seqs = 1;
+
+    std::vector<uint64_t> tokens = {0, 1, 2, 3};
+    SequenceGroup::Ptr seq_group = std::make_shared<SequenceGroup>(
+        0,
+        ov::Tensor(ov::element::i64, {tokens.size()}, tokens.data()),
+        utils::get_greedy_config());
+    const auto seq_id = seq_group->get_running_sequences()[0]->get_id();
+    std::vector<SequenceGroup::Ptr> requests = {seq_group};
+
+    auto orchestrator = init_hybrid_cache_orchestrator(scheduler_config);
+    Scheduler scheduler = Scheduler(orchestrator, scheduler_config);
+
+    std::ignore = scheduler.schedule(requests);
+    seq_group->finish_iteration();
+    ASSERT_EQ(orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE).get_total_number_of_kv_blocks(), 1);
+
+    constexpr size_t checkpoint_count = 4;
+    seq_group->set_num_validated_tokens(checkpoint_count - 1);
+    scheduler.reserve_linear_attention_checkpoints_for_next_schedule(seq_id, checkpoint_count);
+    const auto out = scheduler.schedule(requests);
+
+    ASSERT_TRUE(out.m_linear_attention_paging_data.count(seq_id));
+    EXPECT_EQ(out.m_linear_attention_paging_data.at(seq_id).block_indices.size(), checkpoint_count + 1);
+    EXPECT_EQ(orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE).get_total_number_of_kv_blocks(),
+              1 + checkpoint_count);
+
+    scheduler.free_sequence(seq_id);
+}
+
 TEST(TestScheduler, hybrid_prefix_caching_prefill_requires_read_and_interval_write_blocks) {
     // Target contract (cache_interval=32):
     // prefill requires 1 read block + ceil((processed % interval + scheduled) / interval) write blocks,

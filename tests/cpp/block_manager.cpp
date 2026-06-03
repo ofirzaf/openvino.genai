@@ -274,7 +274,7 @@ TEST(TestBlockManager, FixedSizeFreeSequenceReleasesCapacityForNextSequence) {
     bm.free_sequence(second_seq->get_id());
 }
 
-TEST(TestBlockManager, TemporaryBlocksPromoteSelectedCheckpoint) {
+TEST(TestBlockManager, SpeculativeBlocksCommitSelectedCheckpoint) {
     ov::genai::BlockManager bm = ov::genai::BlockManager(
         /*num_blocks=*/4,
         /*enable_prefix_caching=*/false,
@@ -288,11 +288,16 @@ TEST(TestBlockManager, TemporaryBlocksPromoteSelectedCheckpoint) {
     const auto seq_id = sequence->get_id();
     const int committed_block = bm.get_block_table(seq_id, 0).front()->get_index();
 
-    const auto checkpoint_blocks = bm.reserve_temporary_blocks(seq_id, /*num_blocks=*/3);
+    const auto checkpoint_blocks = bm.reserve_speculative_blocks(seq_id,
+                                                                 /*num_blocks=*/3,
+                                                                 /*base_processed_tokens=*/0,
+                                                                 /*cache_interval=*/1);
     ASSERT_EQ(checkpoint_blocks.size(), 3);
     EXPECT_EQ(bm.num_free_blocks(), 0);
 
-    bm.promote_temporary_block(seq_id, /*checkpoint_slot=*/2);
+    bm.commit_speculative_blocks(sequence,
+                                 /*checkpoint_slot=*/2,
+                                 /*accepted_processed_tokens=*/2);
 
     EXPECT_EQ(bm.get_block_table(seq_id, 0).front()->get_index(), checkpoint_blocks[1]);
     EXPECT_NE(bm.get_block_table(seq_id, 0).front()->get_index(), committed_block);
@@ -302,7 +307,7 @@ TEST(TestBlockManager, TemporaryBlocksPromoteSelectedCheckpoint) {
     EXPECT_EQ(bm.num_free_blocks(), 4);
 }
 
-TEST(TestBlockManager, TemporaryBlocksReleaseWithoutPromotion) {
+TEST(TestBlockManager, SpeculativeBlocksRollbackWithoutCommit) {
     ov::genai::BlockManager bm = ov::genai::BlockManager(
         /*num_blocks=*/3,
         /*enable_prefix_caching=*/false,
@@ -316,17 +321,103 @@ TEST(TestBlockManager, TemporaryBlocksReleaseWithoutPromotion) {
     const auto seq_id = sequence->get_id();
     const int committed_block = bm.get_block_table(seq_id, 0).front()->get_index();
 
-    const auto checkpoint_blocks = bm.reserve_temporary_blocks(seq_id, /*num_blocks=*/2);
+    const auto checkpoint_blocks = bm.reserve_speculative_blocks(seq_id,
+                                                                 /*num_blocks=*/2,
+                                                                 /*base_processed_tokens=*/0,
+                                                                 /*cache_interval=*/1);
     ASSERT_EQ(checkpoint_blocks.size(), 2);
     EXPECT_EQ(bm.num_free_blocks(), 0);
 
-    bm.release_temporary_blocks(seq_id);
+    bm.rollback_speculative_blocks(seq_id);
 
     EXPECT_EQ(bm.get_block_table(seq_id, 0).front()->get_index(), committed_block);
     EXPECT_EQ(bm.num_free_blocks(), 2);
 
     bm.free_sequence(seq_id);
     EXPECT_EQ(bm.num_free_blocks(), 3);
+}
+
+TEST(TestBlockManager, PrefixSpeculativeReservationUsesFreeBlocksBeforeOverwriteable) {
+    constexpr size_t block_size = 4;
+    ov::genai::BlockManager block_manager(
+        /*num_blocks=*/3,
+        /*enable_prefix_caching=*/true,
+        block_size,
+        /*num_layers=*/1);
+
+    std::vector<int64_t> tokens = {0, 1, 2, 3};
+    auto producer_group = create_sequence_group(tokens, 19);
+    producer_group->schedule_tokens(tokens.size());
+    block_manager.append_slots(producer_group);
+    producer_group->finish_iteration();
+
+    const auto producer_seq_id = producer_group->get_running_sequences().at(0)->get_id();
+    const auto cached_block_idx = block_manager.get_block_table(producer_seq_id, 0).at(0)->get_index();
+    block_manager.free_sequence(producer_seq_id);
+
+    std::vector<int64_t> active_tokens = {10, 11, 12, 13};
+    auto active_group = create_sequence_group(active_tokens, 20);
+    active_group->schedule_tokens(active_tokens.size());
+    block_manager.append_slots(active_group);
+
+    const auto active_seq_id = active_group->get_running_sequences().at(0)->get_id();
+    const auto checkpoint_blocks = block_manager.reserve_speculative_blocks(active_seq_id,
+                                                                            /*num_blocks=*/1,
+                                                                            active_tokens.size(),
+                                                                            block_size);
+    ASSERT_EQ(checkpoint_blocks.size(), 1);
+    EXPECT_NE(checkpoint_blocks.front(), cached_block_idx);
+
+    auto restored_group = create_sequence_group(tokens, 21);
+    block_manager.restore_cached_blocks(restored_group);
+    const auto restored_seq_id = restored_group->get_running_sequences().at(0)->get_id();
+    ASSERT_EQ(block_manager.get_block_table(restored_seq_id, 0).size(), 1);
+    EXPECT_EQ(block_manager.get_block_table(restored_seq_id, 0).at(0)->get_index(), cached_block_idx);
+
+    block_manager.rollback_speculative_blocks(active_seq_id);
+    block_manager.free_sequence(active_seq_id);
+    block_manager.free_sequence(restored_seq_id);
+}
+
+TEST(TestBlockManager, PrefixSpeculativeReservationStealsOverwriteableAndDropsStaleHash) {
+    constexpr size_t block_size = 4;
+    ov::genai::BlockManager block_manager(
+        /*num_blocks=*/2,
+        /*enable_prefix_caching=*/true,
+        block_size,
+        /*num_layers=*/1);
+
+    std::vector<int64_t> tokens = {0, 1, 2, 3};
+    auto producer_group = create_sequence_group(tokens, 22);
+    producer_group->schedule_tokens(tokens.size());
+    block_manager.append_slots(producer_group);
+    producer_group->finish_iteration();
+
+    const auto producer_seq_id = producer_group->get_running_sequences().at(0)->get_id();
+    const auto cached_block_idx = block_manager.get_block_table(producer_seq_id, 0).at(0)->get_index();
+    block_manager.free_sequence(producer_seq_id);
+
+    std::vector<int64_t> active_tokens = {10, 11, 12, 13};
+    auto active_group = create_sequence_group(active_tokens, 23);
+    active_group->schedule_tokens(active_tokens.size());
+    block_manager.append_slots(active_group);
+
+    const auto active_seq_id = active_group->get_running_sequences().at(0)->get_id();
+    const auto checkpoint_blocks = block_manager.reserve_speculative_blocks(active_seq_id,
+                                                                            /*num_blocks=*/1,
+                                                                            active_tokens.size(),
+                                                                            block_size);
+    ASSERT_EQ(checkpoint_blocks.size(), 1);
+    EXPECT_EQ(checkpoint_blocks.front(), cached_block_idx);
+
+    auto restored_group = create_sequence_group(tokens, 24);
+    block_manager.restore_cached_blocks(restored_group);
+    const auto restored_seq_id = restored_group->get_running_sequences().at(0)->get_id();
+    EXPECT_TRUE(block_manager.get_block_table(restored_seq_id, 0).empty());
+
+    block_manager.rollback_speculative_blocks(active_seq_id);
+    block_manager.free_sequence(active_seq_id);
+    block_manager.free_sequence(restored_seq_id);
 }
 
 TEST(TestBlockManager, PrefixCachingCompleteCheckpointReuseAllocatesOwnedWriteBlocks) {

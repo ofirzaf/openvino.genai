@@ -267,6 +267,10 @@ public:
         return m_free_blocks_num[layer_idx] + num_overwriteable_blocks();
     }
 
+    size_t num_uncached_free_blocks(size_t layer_idx) const {
+        return m_free_blocks_num[layer_idx];
+    }
+
     /**
      * Returns the number of overwritable blocks (in a prefix caching scenario).
      * @return Number of overwritable blocks for this layer.
@@ -298,6 +302,19 @@ public:
         return num_blocks <= num_free_blocks(layer_idx);
     }
 
+    bool can_allocate_uncached_blocks(size_t num_blocks) const {
+        for (size_t layer_idx = 0; layer_idx < m_num_layers; ++layer_idx) {
+            size_t available_blocks = num_uncached_free_blocks(layer_idx);
+            if (m_enable_prefix_caching) {
+                available_blocks += num_overwriteable_blocks();
+            }
+            if (num_blocks > available_blocks) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /**
      * Frees a given block for a given layer. If no sequence is associated with the block after freeing, the block
      * is returned to the "free" pool.
@@ -319,20 +336,35 @@ public:
      * hash bookkeeping. Intended for transient state checkpoints that are
      * overwritten before they become visible as sequence cache.
      */
-    BlocksPerLayer allocate_uncached_block() {
-        OPENVINO_ASSERT(can_allocate_blocks(1));
+    BlocksPerLayer allocate_uncached_block(std::map<uint64_t, BlocksPerLayer>& cached_blocks) {
+        OPENVINO_ASSERT(can_allocate_uncached_blocks(1));
         BlocksPerLayer allocated_blocks;
         allocated_blocks.reserve(m_num_layers);
-        for (size_t layer_idx = 0; layer_idx < m_num_layers; ++layer_idx) {
-            OPENVINO_ASSERT(m_free_blocks_num[layer_idx] > 0,
-                            "Uncached checkpoint allocation requires a free physical block");
-            CacheBlock::Ptr allocated_block = m_free_blocks[layer_idx].front();
-            allocated_block->increment();
-            allocated_blocks.push_back(allocated_block);
-            m_free_blocks[layer_idx].pop_front();
-            --m_free_blocks_num[layer_idx];
+
+        if (m_free_blocks_num[0] > 0) {
+            for (size_t layer_idx = 0; layer_idx < m_num_layers; ++layer_idx) {
+                OPENVINO_ASSERT(m_free_blocks_num[layer_idx] > 0,
+                                "Uncached checkpoint allocation requires a free physical block");
+                CacheBlock::Ptr allocated_block = m_free_blocks[layer_idx].front();
+                allocated_block->increment();
+                allocated_block->set_hash(0);
+                allocated_blocks.push_back(allocated_block);
+                m_free_blocks[layer_idx].pop_front();
+                --m_free_blocks_num[layer_idx];
+            }
+            return allocated_blocks;
         }
-        return allocated_blocks;
+
+        if (m_enable_prefix_caching && m_overwriteable_blocks.num_blocks() > 0) {
+            allocated_blocks = m_overwriteable_blocks.get_lru_block_to_overwrite();
+            cached_blocks.erase(allocated_blocks.front()->get_hash());
+            for (auto& block : allocated_blocks) {
+                block->set_hash(0);
+            }
+            return allocated_blocks;
+        }
+
+        OPENVINO_THROW("Uncached checkpoint allocation requires a free or overwriteable physical block");
     }
 
     /**
@@ -586,7 +618,12 @@ class BlockManager {
     // stores blocks for each sequence (not sequence group)
     // the same block can be seen in multiple block_tables for different sequences
     std::map<uint64_t, std::vector<BlocksPerLayer>> m_block_table;
-    std::map<uint64_t, std::vector<BlocksPerLayer>> m_temporary_block_table;
+    struct SpeculativeBlockReservation {
+        size_t base_processed_tokens = 0;
+        size_t cache_interval = 1;
+        std::vector<BlocksPerLayer> checkpoint_blocks;
+    };
+    std::map<uint64_t, SpeculativeBlockReservation> m_speculative_block_table;
 
     std::mutex m_cached_blocks_map_mutex;
 public:
@@ -896,81 +933,110 @@ public:
         return m_allocator.num_free_blocks(0); // relying on the invariant that all layers have identical number of blocks
     }
 
-    std::vector<int> reserve_temporary_blocks(uint64_t seq_id, size_t num_blocks) {
+    bool can_reserve_speculative_blocks(size_t num_blocks) const {
+        return m_allocator.can_allocate_uncached_blocks(num_blocks);
+    }
+
+    std::vector<int> reserve_speculative_blocks(uint64_t seq_id,
+                                                size_t num_blocks,
+                                                size_t base_processed_tokens,
+                                                size_t cache_interval) {
         std::lock_guard<std::mutex> lock(m_cached_blocks_map_mutex);
         OPENVINO_ASSERT(m_block_table.count(seq_id) > 0,
-                        "Cannot reserve temporary cache blocks for unknown sequence ", seq_id);
-        OPENVINO_ASSERT(m_temporary_block_table[seq_id].empty(),
-                        "Temporary cache blocks are already reserved for sequence ", seq_id);
-        OPENVINO_ASSERT(can_allocate_blocks(num_blocks),
-                        "Not enough cache blocks to reserve ", num_blocks,
-                        " temporary checkpoints for sequence ", seq_id);
+                        "Cannot reserve speculative cache blocks for unknown sequence ", seq_id);
+        OPENVINO_ASSERT(m_speculative_block_table.find(seq_id) == m_speculative_block_table.end(),
+                        "Speculative cache blocks are already reserved for sequence ", seq_id);
+        OPENVINO_ASSERT(m_allocator.can_allocate_uncached_blocks(num_blocks),
+                        "Not enough free cache blocks to reserve ", num_blocks,
+                        " speculative checkpoints for sequence ", seq_id);
 
-        auto& temporary_blocks = m_temporary_block_table[seq_id];
-        temporary_blocks.reserve(num_blocks);
+        auto& reservation = m_speculative_block_table[seq_id];
+        reservation.base_processed_tokens = base_processed_tokens;
+        reservation.cache_interval = cache_interval == 0 ? 1 : cache_interval;
+        reservation.checkpoint_blocks.reserve(num_blocks);
         std::vector<int> block_indices;
         block_indices.reserve(num_blocks);
         for (size_t idx = 0; idx < num_blocks; ++idx) {
-            BlocksPerLayer blocks = m_allocator.allocate_uncached_block();
-            OPENVINO_ASSERT(!blocks.empty(), "Temporary cache block allocation returned no blocks");
+            BlocksPerLayer blocks = m_allocator.allocate_uncached_block(m_prefix_hash_to_occupied_block_map);
+            OPENVINO_ASSERT(!blocks.empty(), "Speculative cache block allocation returned no blocks");
             block_indices.push_back(blocks.front()->get_index());
-            temporary_blocks.push_back(std::move(blocks));
+            reservation.checkpoint_blocks.push_back(std::move(blocks));
         }
         return block_indices;
     }
 
-    void release_temporary_blocks(uint64_t seq_id) {
+    void rollback_speculative_blocks(uint64_t seq_id) {
         std::lock_guard<std::mutex> lock(m_cached_blocks_map_mutex);
-        auto it = m_temporary_block_table.find(seq_id);
-        if (it == m_temporary_block_table.end()) {
+        auto it = m_speculative_block_table.find(seq_id);
+        if (it == m_speculative_block_table.end()) {
             return;
         }
-        for (const auto& blocks : it->second) {
+        for (const auto& blocks : it->second.checkpoint_blocks) {
             m_allocator.free_uncached(blocks);
         }
-        m_temporary_block_table.erase(it);
+        m_speculative_block_table.erase(it);
     }
 
-    void promote_temporary_block(uint64_t seq_id, size_t checkpoint_slot) {
+    void commit_speculative_blocks(Sequence::Ptr sequence,
+                                   size_t checkpoint_slot,
+                                   size_t accepted_processed_tokens) {
         std::lock_guard<std::mutex> lock(m_cached_blocks_map_mutex);
         OPENVINO_ASSERT(checkpoint_slot > 0,
                         "Checkpoint slot is one-based and must be greater than zero");
-        auto temporary_it = m_temporary_block_table.find(seq_id);
-        OPENVINO_ASSERT(temporary_it != m_temporary_block_table.end(),
-                        "No temporary cache blocks reserved for sequence ", seq_id);
-        auto& temporary_blocks = temporary_it->second;
-        OPENVINO_ASSERT(checkpoint_slot <= temporary_blocks.size(),
+        OPENVINO_ASSERT(sequence, "Cannot commit speculative cache blocks for null sequence");
+        const uint64_t seq_id = sequence->get_id();
+        auto speculative_it = m_speculative_block_table.find(seq_id);
+        OPENVINO_ASSERT(speculative_it != m_speculative_block_table.end(),
+                        "No speculative cache blocks reserved for sequence ", seq_id);
+        auto& reservation = speculative_it->second;
+        auto& checkpoint_blocks = reservation.checkpoint_blocks;
+        OPENVINO_ASSERT(checkpoint_slot <= checkpoint_blocks.size(),
                         "Checkpoint slot ", checkpoint_slot, " is out of range for sequence ", seq_id,
-                        ", reserved checkpoints: ", temporary_blocks.size());
+                        ", reserved checkpoints: ", checkpoint_blocks.size());
+        const size_t selected_processed_tokens = reservation.base_processed_tokens + checkpoint_slot;
+        OPENVINO_ASSERT(accepted_processed_tokens == selected_processed_tokens,
+                        "Accepted processed token count ", accepted_processed_tokens,
+                        " does not match linear attention checkpoint slot ", checkpoint_slot,
+                        " for sequence ", seq_id, " with base processed tokens ",
+                        reservation.base_processed_tokens);
 
         auto table_it = m_block_table.find(seq_id);
         OPENVINO_ASSERT(table_it != m_block_table.end(),
-                        "Cannot promote temporary cache block for unknown sequence ", seq_id);
+                        "Cannot commit speculative cache block for unknown sequence ", seq_id);
         auto& block_table = table_it->second;
         OPENVINO_ASSERT(block_table.size() == m_num_layers,
-                        "Temporary cache promotion expects one block table per layer");
-        for (size_t layer_idx = 0; layer_idx < m_num_layers; ++layer_idx) {
-            OPENVINO_ASSERT(block_table[layer_idx].size() == 1,
-                            "Temporary cache promotion supports fixed one-block sequence state only");
-        }
+                        "Speculative cache commit expects one block table per layer");
 
-        const size_t selected_index = checkpoint_slot - 1;
-        BlocksPerLayer selected_blocks = temporary_blocks[selected_index];
-        BlocksPerLayer previous_blocks;
-        previous_blocks.reserve(m_num_layers);
-        for (size_t layer_idx = 0; layer_idx < m_num_layers; ++layer_idx) {
-            previous_blocks.push_back(block_table[layer_idx][0]);
-            block_table[layer_idx][0] = selected_blocks[layer_idx];
-        }
-        m_allocator.free_uncached(previous_blocks);
-
-        for (size_t idx = 0; idx < temporary_blocks.size(); ++idx) {
-            if (idx == selected_index) {
+        std::vector<bool> committed(checkpoint_blocks.size(), false);
+        for (size_t slot = 1; slot <= checkpoint_slot; ++slot) {
+            const size_t processed_tokens = reservation.base_processed_tokens + slot;
+            const bool selected_slot = slot == checkpoint_slot;
+            const bool interval_boundary = processed_tokens % reservation.cache_interval == 0;
+            if (m_enable_prefix_caching && !selected_slot && !interval_boundary) {
                 continue;
             }
-            m_allocator.free_uncached(temporary_blocks[idx]);
+            const size_t logical_position = m_enable_prefix_caching
+                                                ? (processed_tokens - 1) / reservation.cache_interval
+                                                : 0;
+            const size_t checkpoint_index = slot - 1;
+            BlocksPerLayer selected_blocks = checkpoint_blocks[checkpoint_index];
+            if (m_enable_prefix_caching) {
+                const size_t hash = sequence->get_hash(processed_tokens, m_block_size);
+                for (auto& block : selected_blocks) {
+                    block->set_hash(hash);
+                }
+                m_prefix_hash_to_occupied_block_map[hash] = selected_blocks;
+            }
+            replace_sequence_blocks(seq_id, logical_position, selected_blocks);
+            committed[checkpoint_index] = true;
         }
-        m_temporary_block_table.erase(temporary_it);
+
+        for (size_t idx = 0; idx < checkpoint_blocks.size(); ++idx) {
+            if (!committed[idx]) {
+                m_allocator.free_uncached(checkpoint_blocks[idx]);
+            }
+        }
+        m_speculative_block_table.erase(speculative_it);
     }
 
     /**
@@ -1110,12 +1176,12 @@ public:
      */
     void free_sequence(size_t seq_id) {
         std::lock_guard<std::mutex> lock(m_cached_blocks_map_mutex);
-        auto temporary_it = m_temporary_block_table.find(seq_id);
-        if (temporary_it != m_temporary_block_table.end()) {
-            for (const auto& blocks : temporary_it->second) {
+        auto speculative_it = m_speculative_block_table.find(seq_id);
+        if (speculative_it != m_speculative_block_table.end()) {
+            for (const auto& blocks : speculative_it->second.checkpoint_blocks) {
                 m_allocator.free_uncached(blocks);
             }
-            m_temporary_block_table.erase(temporary_it);
+            m_speculative_block_table.erase(speculative_it);
         }
         OPENVINO_ASSERT(m_block_table.find(seq_id) != m_block_table.end(), "sequence with id ", seq_id,
                         " not found in BlockManager, but requested to free");
@@ -1486,7 +1552,7 @@ public:
         // KV-cache should not be cleared if prefix caching is enabled
         OPENVINO_ASSERT(m_enable_prefix_caching == false);
 
-        m_temporary_block_table.clear();
+        m_speculative_block_table.clear();
         m_allocator.clear();
         m_prefix_hash_to_occupied_block_map.clear();
 
@@ -1577,6 +1643,52 @@ private:
                     m_block_table[sequence_id][layer_idx].push_back(blocks_for_all_layers[layer_idx]);
                 }
             }
+        }
+    }
+
+    void replace_sequence_blocks(uint64_t seq_id,
+                                 size_t logical_position,
+                                 const BlocksPerLayer& new_blocks) {
+        OPENVINO_ASSERT(new_blocks.size() == m_num_layers);
+        auto& block_table = m_block_table[seq_id];
+        OPENVINO_ASSERT(block_table.size() == m_num_layers);
+
+        BlocksPerLayer previous_blocks;
+        previous_blocks.reserve(m_num_layers);
+        const bool replace_existing = logical_position < block_table[0].size();
+        if (replace_existing) {
+            for (size_t layer_idx = 0; layer_idx < m_num_layers; ++layer_idx) {
+                OPENVINO_ASSERT(logical_position < block_table[layer_idx].size(),
+                                "Linear attention block table layers are out of sync");
+                previous_blocks.push_back(block_table[layer_idx][logical_position]);
+                block_table[layer_idx][logical_position] = new_blocks[layer_idx];
+            }
+        } else {
+            for (size_t layer_idx = 0; layer_idx < m_num_layers; ++layer_idx) {
+                OPENVINO_ASSERT(logical_position == block_table[layer_idx].size(),
+                                "Cannot create a gap in the sequence block table");
+                block_table[layer_idx].push_back(new_blocks[layer_idx]);
+            }
+        }
+
+        if (!previous_blocks.empty()) {
+            erase_prefix_hash_if_points_to(previous_blocks);
+            m_allocator.free_uncached(previous_blocks);
+        }
+    }
+
+    void erase_prefix_hash_if_points_to(const BlocksPerLayer& blocks) {
+        if (!m_enable_prefix_caching || blocks.empty()) {
+            return;
+        }
+        auto it = m_prefix_hash_to_occupied_block_map.find(blocks.front()->get_hash());
+        if (it == m_prefix_hash_to_occupied_block_map.end() || it->second.empty()) {
+            return;
+        }
+        // Block indices are expected to identify the same physical block set
+        // across layers; compare the first layer as the representative.
+        if (it->second.front()->get_index() == blocks.front()->get_index()) {
+            m_prefix_hash_to_occupied_block_map.erase(it);
         }
     }
 };

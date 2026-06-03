@@ -223,7 +223,6 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
 
     auto main_model = main_model_desc.model;
     OPENVINO_ASSERT(main_model && draft_model_desc.model, "DFlash requires both target and draft models.");
-    const bool target_has_linear_attention = utils::get_cache_types(*main_model).has_linear();
 
     bool allow_score_aggregation = true;
     bool allow_xattention = false;
@@ -240,11 +239,6 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
     auto main_generation_config = main_model_desc.generation_config;
     dflash_cb::ensure_num_assistant_tokens_is_set(main_generation_config);
     m_generation_config = main_generation_config;
-    auto target_scheduler_config = main_model_desc.scheduler_config;
-    target_scheduler_config.num_linear_attention_blocks =
-        dflash_cb::adjusted_linear_attention_block_count(target_scheduler_config.num_linear_attention_blocks,
-                                                         main_generation_config.num_assistant_tokens,
-                                                         target_has_linear_attention);
     auto draft_model_desc_for_runner = draft_model_desc;
     if (draft_model_desc_for_runner.device.empty()) {
         draft_model_desc_for_runner.device = main_model_desc.device;
@@ -258,7 +252,7 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
         main_model,
         main_model_desc.tokenizer,
         main_generation_config,
-        target_scheduler_config,
+        main_model_desc.scheduler_config,
         main_model_desc.device,
         main_model_desc.properties,
         true);
@@ -488,8 +482,12 @@ void ContinuousBatchingPipeline::DFlashDecodingImpl::step() {
             dflash_cb::linear_attention_checkpoint_slot_for_validation(
                 accounting,
                 /*validation_input_includes_seed_token=*/true);
+        OPENVINO_ASSERT(!state.generated_tokens.empty(),
+                        "DFlash cannot commit a linear attention checkpoint without generated tokens.");
+        const size_t accepted_processed_tokens = state.prompt_len + state.generated_tokens.size() - 1;
         m_main_pipeline->promote_linear_attention_checkpoint_for_sequence(state.target_la_checkpoint_sequence_id,
-                                                                         checkpoint_slot);
+                                                                         checkpoint_slot,
+                                                                         accepted_processed_tokens);
         state.target_la_checkpoint_sequence_id = std::numeric_limits<uint64_t>::max();
         const float acceptance_rate =
             draft_generated > 0 ? static_cast<float>(accounting.accepted) / draft_generated * 100.0f : 0.0f;
