@@ -330,6 +330,7 @@ std::tuple<std::shared_ptr<ov::Node>, int64_t> find_llm_matmul(const std::shared
     // Matmul -> Add -> Result
     // Matmul -> Transpose -> Result
     // MatMul -> Divide -> Tanh -> Multiply -> Result
+    // MatMul -> Multiply(output_multiplier) -> Divide -> Tanh -> Multiply -> Result
     if (!matmul) {
         if (auto add = ov::as_type_ptr<ov::op::v1::Add>(last_node)) {
             matmul = ov::as_type_ptr<ov::op::v0::MatMul>(add->input_value(0).get_node_shared_ptr());
@@ -340,7 +341,17 @@ std::tuple<std::shared_ptr<ov::Node>, int64_t> find_llm_matmul(const std::shared
         } else if (auto multiply = ov::as_type_ptr<ov::op::v1::Multiply>(last_node)) {
             if (auto tanh = ov::as_type_ptr<ov::op::v0::Tanh>(multiply->input_value(0).get_node_shared_ptr())) {
                 if (auto divide = ov::as_type_ptr<ov::op::v1::Divide>(tanh->input_value(0).get_node_shared_ptr())) {
-                    matmul = as_type_ptr<ov::op::v0::MatMul>(divide->input_value(0).get_node_shared_ptr());
+                    auto matmul_input = divide->input_value(0).get_node_shared_ptr();
+                    if (auto output_multiplier = ov::as_type_ptr<ov::op::v1::Multiply>(matmul_input)) {
+                        const auto lhs = output_multiplier->input_value(0).get_node_shared_ptr();
+                        const auto rhs = output_multiplier->input_value(1).get_node_shared_ptr();
+                        if (ov::as_type_ptr<ov::op::v0::Constant>(rhs)) {
+                            matmul_input = lhs;
+                        } else if (ov::as_type_ptr<ov::op::v0::Constant>(lhs)) {
+                            matmul_input = rhs;
+                        }
+                    }
+                    matmul = as_type_ptr<ov::op::v0::MatMul>(matmul_input);
                 }
             }
         }
