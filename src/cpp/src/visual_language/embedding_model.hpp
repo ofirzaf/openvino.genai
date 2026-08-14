@@ -44,6 +44,12 @@ public:
                     const std::string& device,
                     const ov::AnyMap& properties);
 
+    // Internal deferred-compile path for a component graph transformed at load time.
+    EmbeddingsModel(const std::shared_ptr<ov::Model>& model,
+                    const float scale_emb,
+                    const std::string& device,
+                    const ov::AnyMap& properties);
+
     EmbeddingsModel() = default;
 
     static Ptr create(const std::filesystem::path& model_dir,
@@ -59,6 +65,13 @@ public:
                       const std::string& device,
                       const ov::AnyMap& properties) {
         return std::make_shared<EmbeddingsModel>(model, weights, scale_emb, device, properties);
+    }
+
+    static Ptr create(const std::shared_ptr<ov::Model>& model,
+                      const float scale_emb,
+                      const std::string& device,
+                      const ov::AnyMap& properties) {
+        return std::make_shared<EmbeddingsModel>(model, scale_emb, device, properties);
     }
 
     // We have getter for the request queue, so we can reserve request outside of infer scope

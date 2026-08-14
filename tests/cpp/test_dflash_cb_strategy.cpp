@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstring>
 #include <memory>
 #include <numeric>
 #include <string>
@@ -18,7 +19,9 @@
 #include "openvino/op/matmul.hpp"
 #include "openvino/op/multiply.hpp"
 #include "openvino/op/parameter.hpp"
+#include "openvino/op/power.hpp"
 #include "openvino/op/read_value.hpp"
+#include "openvino/op/reduce_mean.hpp"
 #include "openvino/op/reshape.hpp"
 #include "openvino/op/result.hpp"
 #include "openvino/op/scaled_dot_product_attention.hpp"
@@ -26,6 +29,7 @@
 #include "openvino/op/unsqueeze.hpp"
 #include "openvino/op/util/variable.hpp"
 #include "openvino/pass/sdpa_to_paged_attention.hpp"
+#include "openvino/runtime/core.hpp"
 #include "speculative_decoding/continuous_batching/dflash_strategy_utils.hpp"
 #include "speculative_decoding/dflash_model_transforms.hpp"
 #include "utils.hpp"
@@ -128,6 +132,89 @@ std::shared_ptr<ov::Model> make_dflash_draft_hidden_states_model(const ov::Parti
     return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{hidden_states});
 }
 
+std::shared_ptr<ov::Model> make_muse_embedding_component(size_t rank,
+                                                         const std::string& output_name,
+                                                         float epsilon = 1e-5f,
+                                                         bool add_learned_scale = false) {
+    OPENVINO_ASSERT(rank == 2 || rank == 3, "Synthetic Muse component rank must be 2 or 3.");
+    ov::PartialShape shape = rank == 3 ? ov::PartialShape{-1, -1, 4} : ov::PartialShape{-1, 4};
+    auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, shape);
+    input->set_friendly_name("component_input");
+    input->output(0).set_names({"component_input"});
+
+    const ov::Shape scalar_shape(rank, 1);
+    auto square_exponent =
+        ov::op::v0::Constant::create(ov::element::f32, scalar_shape, std::vector<float>{2.0f});
+    auto square = std::make_shared<ov::op::v1::Power>(input, square_exponent);
+    auto reduce_axes =
+        ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{-1});
+    auto reduce_mean = std::make_shared<ov::op::v1::ReduceMean>(square, reduce_axes, true);
+    auto epsilon_constant =
+        ov::op::v0::Constant::create(ov::element::f32, scalar_shape, std::vector<float>{epsilon});
+    auto epsilon_add = std::make_shared<ov::op::v1::Add>(reduce_mean, epsilon_constant);
+    auto inverse_exponent =
+        ov::op::v0::Constant::create(ov::element::f32, scalar_shape, std::vector<float>{-0.5f});
+    auto inverse_rms = std::make_shared<ov::op::v1::Power>(epsilon_add, inverse_exponent);
+    ov::Output<ov::Node> normalized = std::make_shared<ov::op::v1::Multiply>(input, inverse_rms);
+    if (add_learned_scale) {
+        auto gamma =
+            ov::op::v0::Constant::create(ov::element::f32, ov::Shape{4}, std::vector<float>{1.0f, 1.0f, 1.0f, 1.0f});
+        normalized = std::make_shared<ov::op::v1::Multiply>(normalized, gamma);
+    }
+
+    auto result = std::make_shared<ov::op::v0::Result>(normalized);
+    result->set_friendly_name(output_name);
+    result->output(0).set_names({output_name});
+    return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{input});
+}
+
+std::shared_ptr<ov::Model> make_muse_language_model() {
+    auto inputs_embeds = std::make_shared<ov::op::v0::Parameter>(
+        ov::element::f32, ov::PartialShape{-1, -1, 4});
+    inputs_embeds->set_friendly_name("inputs_embeds");
+    inputs_embeds->output(0).set_names({"inputs_embeds"});
+
+    auto direct_result = std::make_shared<ov::op::v0::Result>(inputs_embeds);
+    direct_result->set_friendly_name("lm_output");
+    direct_result->output(0).set_names({"lm_output"});
+    auto one = ov::op::v0::Constant::create(
+        ov::element::f32, ov::Shape{1, 1, 4}, std::vector<float>{1.0f, 1.0f, 1.0f, 1.0f});
+    auto residual = std::make_shared<ov::op::v1::Add>(inputs_embeds, one);
+    auto residual_result = std::make_shared<ov::op::v0::Result>(residual);
+    residual_result->set_friendly_name("lm_residual");
+    residual_result->output(0).set_names({"lm_residual"});
+    return std::make_shared<ov::Model>(
+        ov::ResultVector{direct_result, residual_result}, ov::ParameterVector{inputs_embeds});
+}
+
+ov::Tensor infer_model(const std::shared_ptr<ov::Model>& model,
+                       const std::string& output_name,
+                       const ov::Tensor& input) {
+    auto compiled = ov::Core().compile_model(model, "CPU");
+    auto request = compiled.create_infer_request();
+    request.set_input_tensor(input);
+    request.infer();
+    return request.get_tensor(output_name);
+}
+
+ov::Tensor add_batch_dimension(const ov::Tensor& rank2_tensor) {
+    const auto shape = rank2_tensor.get_shape();
+    OPENVINO_ASSERT(shape.size() == 2, "Expected a rank-2 tensor.");
+    ov::Tensor result(rank2_tensor.get_element_type(), ov::Shape{1, shape[0], shape[1]});
+    std::memcpy(result.data(), rank2_tensor.data(), rank2_tensor.get_byte_size());
+    return result;
+}
+
+void expect_tensors_near(const ov::Tensor& actual, const ov::Tensor& expected, float tolerance = 1e-6f) {
+    ASSERT_EQ(actual.get_shape(), expected.get_shape());
+    ASSERT_EQ(actual.get_element_type(), expected.get_element_type());
+    const auto actual_values = actual.data<const float>();
+    const auto expected_values = expected.data<const float>();
+    for (size_t index = 0; index < actual.get_size(); ++index) {
+        EXPECT_NEAR(actual_values[index], expected_values[index], tolerance) << "at index " << index;
+    }
+}
+
 ov::Tensor make_token_major_hidden_delta(size_t seq_len, size_t hidden_size, float start = 0.0f) {
     ov::Tensor tensor(ov::element::f32, ov::Shape{seq_len, 1, hidden_size});
     std::iota(tensor.data<float>(), tensor.data<float>() + tensor.get_size(), start);
@@ -211,6 +298,101 @@ TEST(DFlashModelTransforms, AppliesAndExtractsDraftRtInfo) {
     ASSERT_EQ(rt_info.mask_token_id, 151669);
     ASSERT_EQ(rt_info.target_layer_ids, (std::vector<int32_t>{1, 12, 23, 34, 45}));
     ASSERT_TRUE(properties.empty());
+}
+
+TEST(MuseGlimmerEmbeddingNorm, MovesComponentNormToLanguageInput) {
+    auto baseline_text = make_muse_embedding_component(3, "inputs_embeds");
+    auto baseline_vision = make_muse_embedding_component(2, "last_hidden_state");
+    auto baseline_language = make_muse_language_model();
+    auto text = make_muse_embedding_component(3, "inputs_embeds");
+    auto vision = make_muse_embedding_component(2, "last_hidden_state");
+    auto language = make_muse_language_model();
+
+    ov::Tensor text_input(ov::element::f32, ov::Shape{1, 2, 4});
+    std::copy_n(std::vector<float>{1.0f, 2.0f, 3.0f, 4.0f, -2.0f, 0.5f, 1.0f, 3.0f}.data(),
+                text_input.get_size(),
+                text_input.data<float>());
+    ov::Tensor vision_input(ov::element::f32, ov::Shape{3, 4});
+    std::copy_n(std::vector<float>{3.0f, 4.0f, 0.0f, 0.0f,
+                                   -1.0f, 2.0f, -3.0f, 4.0f,
+                                   0.5f, -0.5f, 1.0f, -1.0f}.data(),
+                vision_input.get_size(),
+                vision_input.data<float>());
+
+    const auto baseline_text_embeddings = infer_model(baseline_text, "inputs_embeds", text_input);
+    const auto baseline_vision_embeddings = infer_model(baseline_vision, "last_hidden_state", vision_input);
+    const auto baseline_text_logits = infer_model(baseline_language, "lm_output", baseline_text_embeddings);
+    const auto baseline_vision_logits =
+        infer_model(baseline_language, "lm_output", add_batch_dimension(baseline_vision_embeddings));
+
+    ov::genai::utils::dflash::hoist_muse_glimmer_embedding_norms(language, text, vision, 1.0f);
+
+    const auto raw_text_embeddings = infer_model(text, "inputs_embeds", text_input);
+    const auto raw_vision_embeddings = infer_model(vision, "last_hidden_state", vision_input);
+    EXPECT_NE(tensor_values(raw_text_embeddings), tensor_values(baseline_text_embeddings));
+    EXPECT_NE(tensor_values(raw_vision_embeddings), tensor_values(baseline_vision_embeddings));
+    expect_tensors_near(
+        infer_model(language, "lm_output", raw_text_embeddings), baseline_text_logits);
+    expect_tensors_near(
+        infer_model(language, "lm_output", add_batch_dimension(raw_vision_embeddings)), baseline_vision_logits);
+
+    ASSERT_EQ(text->output("inputs_embeds").get_partial_shape(), ov::PartialShape({-1, -1, 4}));
+    ASSERT_EQ(vision->output("last_hidden_state").get_partial_shape(), ov::PartialShape({-1, 4}));
+    ASSERT_EQ(text->output("inputs_embeds").get_element_type(), ov::element::f32);
+    ASSERT_EQ(vision->output("last_hidden_state").get_element_type(), ov::element::f32);
+
+    const auto direct_result = language->output("lm_output").get_node_shared_ptr();
+    const auto residual_result = language->output("lm_residual").get_node_shared_ptr();
+    const auto residual = ov::as_type_ptr<ov::op::v1::Add>(residual_result->input_value(0).get_node_shared_ptr());
+    ASSERT_TRUE(residual);
+    ASSERT_TRUE(ov::as_type_ptr<ov::op::v1::Multiply>(direct_result->input_value(0).get_node_shared_ptr()));
+    EXPECT_EQ(direct_result->input_value(0).get_node_shared_ptr(), residual->input_value(0).get_node_shared_ptr());
+}
+
+TEST(MuseGlimmerEmbeddingNorm, RejectsMismatchedOrUnsupportedGraphsBeforeRewiring) {
+    {
+        auto text = make_muse_embedding_component(3, "inputs_embeds", 1e-5f);
+        auto vision = make_muse_embedding_component(2, "last_hidden_state", 1e-6f);
+        auto language = make_muse_language_model();
+
+        EXPECT_THROW(
+            ov::genai::utils::dflash::hoist_muse_glimmer_embedding_norms(language, text, vision, 1.0f),
+            ov::Exception);
+        EXPECT_TRUE(ov::as_type_ptr<ov::op::v1::Multiply>(
+            text->output("inputs_embeds").get_node_shared_ptr()->input_value(0).get_node_shared_ptr()));
+        EXPECT_TRUE(ov::as_type_ptr<ov::op::v1::Multiply>(
+            vision->output("last_hidden_state").get_node_shared_ptr()->input_value(0).get_node_shared_ptr()));
+    }
+    {
+        auto text = make_muse_embedding_component(3, "inputs_embeds", 1e-5f, true);
+        auto vision = make_muse_embedding_component(2, "last_hidden_state");
+        auto language = make_muse_language_model();
+
+        EXPECT_THROW(
+            ov::genai::utils::dflash::hoist_muse_glimmer_embedding_norms(language, text, vision, 1.0f),
+            ov::Exception);
+    }
+    {
+        auto text = make_muse_embedding_component(3, "inputs_embeds");
+        auto vision = make_muse_embedding_component(2, "last_hidden_state");
+        auto language = make_muse_language_model();
+
+        EXPECT_THROW(
+            ov::genai::utils::dflash::hoist_muse_glimmer_embedding_norms(language, text, vision, 2.0f),
+            ov::Exception);
+    }
+}
+
+TEST(MuseGlimmerEmbeddingNorm, RejectsASecondApplication) {
+    auto text = make_muse_embedding_component(3, "inputs_embeds");
+    auto vision = make_muse_embedding_component(2, "last_hidden_state");
+    auto language = make_muse_language_model();
+
+    ASSERT_NO_THROW(
+        ov::genai::utils::dflash::hoist_muse_glimmer_embedding_norms(language, text, vision, 1.0f));
+    EXPECT_THROW(
+        ov::genai::utils::dflash::hoist_muse_glimmer_embedding_norms(language, text, vision, 1.0f),
+        ov::Exception);
 }
 
 TEST(DFlashModelTransforms, FallsBackToEagle3LayerPatternWithoutAnnotations) {

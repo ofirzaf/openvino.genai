@@ -70,6 +70,21 @@ EmbeddingsModel::EmbeddingsModel(const std::string& model,
     m_embeddings_requests_queue = init(compiled_model);
 }
 
+EmbeddingsModel::EmbeddingsModel(const std::shared_ptr<ov::Model>& model,
+                                 const float scale_emb,
+                                 const std::string& device,
+                                 const ov::AnyMap& properties) {
+    OPENVINO_ASSERT(model, "Text embeddings model cannot be null.");
+    ov::Core core = utils::singleton_core();
+    const auto text_embeddings_props = utils::get_model_properties(properties, "text_embeddings", device);
+    // Keep the existing postprocess and compile path after a load-time graph rewrite.
+    merge_postprocess(model, scale_emb);
+
+    ov::CompiledModel compiled_model = core.compile_model(model, device, text_embeddings_props);
+    ov::genai::utils::print_compiled_model_properties(compiled_model, "text embeddings model");
+    m_embeddings_requests_queue = init(compiled_model);
+}
+
 std::unique_ptr<CircularBufferQueue<EmbeddingsRequest>>& EmbeddingsModel::get_request_queue() {
     return this->m_embeddings_requests_queue;
 }

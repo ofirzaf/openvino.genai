@@ -47,6 +47,24 @@ void apply_dflash_rt_info(std::shared_ptr<ov::Model>& model, ov::AnyMap& propert
 DFlashRTInfo extract_dflash_info_from_config(ov::AnyMap& config);
 
 /**
+ * @brief Moves Muse Glimmer's terminal component RMSNorm to the target language-model input.
+ *
+ * This is valid only for the exported Muse Glimmer layout: the text and vision
+ * component models must end in equivalent, weightless FP32 RMSNorms, while the
+ * language model must expose a rank-3 FP32 `inputs_embeds` input. The component
+ * Results are rewired to their raw activations and an equivalent clone of the
+ * text norm is connected to every original consumer of the language-model input.
+ *
+ * The transform is intentionally strict and is not idempotent. It must be run
+ * once on pristine, uncompiled in-memory models before any DFlash or paged
+ * attention graph transforms.
+ */
+void hoist_muse_glimmer_embedding_norms(const std::shared_ptr<ov::Model>& language_model,
+                                        const std::shared_ptr<ov::Model>& text_embeddings_model,
+                                        const std::shared_ptr<ov::Model>& vision_embeddings_model,
+                                        float scale_emb);
+
+/**
  * @brief Parses target hidden-state RT info and resolves the requested locators.
  *
  * Returns std::nullopt when the metadata is absent.

@@ -60,6 +60,23 @@ VisionEncoder::VisionEncoder(
     resolve_processor_configs(config_dir_path);
 }
 
+VisionEncoder::VisionEncoder(
+    const std::shared_ptr<ov::Model>& model,
+    const std::filesystem::path& config_dir_path,
+    const std::string& device,
+    const ov::AnyMap properties) {
+    OPENVINO_ASSERT(model, "VLM vision embeddings model cannot be null.");
+    auto compiled_model = utils::singleton_core().compile_model(
+        model, device, utils::get_model_properties(properties, "vision_embeddings", device));
+    ov::genai::utils::print_compiled_model_properties(compiled_model, "VLM vision embeddings model");
+    m_ireq_queue_vision_encoder = std::make_unique<CircularBufferQueue<ov::InferRequest>>(
+        compiled_model.get_property(ov::optimal_number_of_infer_requests),
+        [&compiled_model]() -> ov::InferRequest {
+            return compiled_model.create_infer_request();
+        });
+    resolve_processor_configs(config_dir_path);
+}
+
 void VisionEncoder::resolve_processor_configs(const std::filesystem::path& config_dir_path) {
     // TODO Consider using separate class or struct for combined processor_config.json
     const std::string processor_config_filename = "processor_config.json";
@@ -201,6 +218,17 @@ VisionEncoder::Ptr VisionEncoder::create(
     } else {
         OPENVINO_THROW("Unsupported model type in VLM VisionEncoder class. Please, create feature request on new model support");
     }
+}
+
+VisionEncoder::Ptr VisionEncoder::create(
+    const std::shared_ptr<ov::Model>& model,
+    const std::filesystem::path& config_dir_path,
+    const VLMModelType model_type,
+    const std::string& device,
+    const ov::AnyMap properties) {
+    OPENVINO_ASSERT(model_type == VLMModelType::MUSE_GLIMMER,
+                    "Preloaded VLM component models are supported only for Muse Glimmer.");
+    return std::make_shared<VisionEncoderMuseGlimmer>(model, config_dir_path, device, properties);
 }
 
 } // namespace ov::genai

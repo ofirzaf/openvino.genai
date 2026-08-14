@@ -121,6 +121,31 @@ InputsEmbedder::IInputsEmbedder::IInputsEmbedder(
     m_tokenizer(tokenizer),
     m_pruning_processor(std::make_shared<VisionTokenPruningProcessor>(device)) { }
 
+InputsEmbedder::IInputsEmbedder::IInputsEmbedder(
+        const VLMConfig& vlm_config,
+        const std::shared_ptr<ov::Model>& text_embeddings_model,
+        const std::shared_ptr<ov::Model>& vision_embeddings_model,
+        const std::filesystem::path& config_dir_path,
+        const Tokenizer& tokenizer,
+        const std::string& device,
+        const ov::AnyMap device_config) :
+    m_vlm_config{vlm_config},
+    m_vision_encoder(VisionEncoder::create(
+        vision_embeddings_model,
+        config_dir_path,
+        m_vlm_config.model_type,
+        device,
+        device_config
+    )),
+    m_embedding(EmbeddingsModel::create(
+        text_embeddings_model,
+        m_vlm_config.scale_emb,
+        device,
+        device_config
+    )),
+    m_tokenizer(tokenizer),
+    m_pruning_processor(std::make_shared<VisionTokenPruningProcessor>(device)) { }
+
 ov::Tensor InputsEmbedder::IInputsEmbedder::apply_chat_template_tokenize(const std::string& prompt, ov::genai::VLMPerfMetrics& metrics) {
     bool add_special_tokens = m_add_special_tokens_is_set ? m_add_special_tokens : !(m_is_chat_conversation || m_apply_chat_template);
     ManualTimer encode_timer("Encode");
@@ -440,6 +465,24 @@ InputsEmbedder::InputsEmbedder(const ModelsMap& models_map,
     } else {
         OPENVINO_THROW("Unsupported model type in VLM InputsEmbedder class. Please, create feature request on new model support");
     }
+}
+
+InputsEmbedder::InputsEmbedder(const std::filesystem::path& config_dir_path,
+                               const Tokenizer& tokenizer,
+                               const std::shared_ptr<ov::Model>& text_embeddings_model,
+                               const std::shared_ptr<ov::Model>& vision_embeddings_model,
+                               const std::string& device,
+                               const ov::AnyMap device_config) {
+    auto vlm_config = utils::from_config_json_if_exists<VLMConfig>(config_dir_path, "config.json");
+    OPENVINO_ASSERT(vlm_config.model_type == VLMModelType::MUSE_GLIMMER,
+                    "Preloaded VLM component models are supported only for Muse Glimmer.");
+    m_impl = std::make_shared<InputsEmbedderMuseGlimmer>(vlm_config,
+                                                         text_embeddings_model,
+                                                         vision_embeddings_model,
+                                                         config_dir_path,
+                                                         tokenizer,
+                                                         device,
+                                                         device_config);
 }
 
 ov::Tensor InputsEmbedder::get_inputs_embeds(const std::string& prompt, const std::vector<ov::genai::EncodedImage>& images, ov::genai::VLMPerfMetrics& metrics, bool recalculate_merged_embeddings, const std::vector<size_t>& image_sequence) {

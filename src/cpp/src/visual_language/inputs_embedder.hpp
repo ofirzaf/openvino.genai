@@ -49,6 +49,14 @@ public:
                    const std::string& device,
                    const ov::AnyMap device_config);
 
+    // Internal deferred-compile path for pre-read component models.
+    InputsEmbedder(const std::filesystem::path& config_dir_path,
+                   const Tokenizer& tokenizer,
+                   const std::shared_ptr<ov::Model>& text_embeddings_model,
+                   const std::shared_ptr<ov::Model>& vision_embeddings_model,
+                   const std::string& device,
+                   const ov::AnyMap device_config);
+
     // compute input embedding for prompt and multiple images
     ov::Tensor get_inputs_embeds(const std::string& prompt, const std::vector<ov::genai::EncodedImage>& images, ov::genai::VLMPerfMetrics& metrics, bool recalculate_merged_embeddings = true, const std::vector<size_t>& image_sequence = {});
 
@@ -309,6 +317,15 @@ private:
             const ModelsMap& models_map,
             const Tokenizer& tokenizer,
             const std::filesystem::path& config_dir_path,
+            const std::string& device,
+            const ov::AnyMap device_config);
+
+        IInputsEmbedder(
+            const VLMConfig& vlm_config,
+            const std::shared_ptr<ov::Model>& text_embeddings_model,
+            const std::shared_ptr<ov::Model>& vision_embeddings_model,
+            const std::filesystem::path& config_dir_path,
+            const Tokenizer& tokenizer,
             const std::string& device,
             const ov::AnyMap device_config);
 

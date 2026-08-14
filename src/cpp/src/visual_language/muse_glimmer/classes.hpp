@@ -41,6 +41,14 @@ public:
                               const std::string& device,
                               const ov::AnyMap device_config);
 
+    InputsEmbedderMuseGlimmer(const VLMConfig& vlm_config,
+                              const std::shared_ptr<ov::Model>& text_embeddings_model,
+                              const std::shared_ptr<ov::Model>& vision_embeddings_model,
+                              const std::filesystem::path& config_dir_path,
+                              const Tokenizer& tokenizer,
+                              const std::string& device,
+                              const ov::AnyMap device_config);
+
     std::vector<EncodedImage> encode_images(const std::vector<ov::Tensor>& images) override;
 
     std::vector<EncodedVideo> encode_videos(const std::vector<ov::Tensor>& videos,

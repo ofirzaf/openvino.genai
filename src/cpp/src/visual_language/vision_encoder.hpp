@@ -121,6 +121,14 @@ public:
         const std::string& device,
         const ov::AnyMap properties = {});
 
+    // Internal deferred-compile path for a component graph transformed at load time.
+    static VisionEncoder::Ptr create(
+        const std::shared_ptr<ov::Model>& model,
+        const std::filesystem::path& config_dir_path,
+        const VLMModelType model_type,
+        const std::string& device,
+        const ov::AnyMap properties = {});
+
     /// @brief Compute embeddings of an image given
     /// ProcessorConfig members.
     /// @param image An image to infer embeddings for. Image shape must be
@@ -172,6 +180,12 @@ public:
 
     VisionEncoder(
         const ModelsMap& models_map,
+        const std::filesystem::path& config_dir_path,
+        const std::string& device,
+        const ov::AnyMap properties);
+
+    VisionEncoder(
+        const std::shared_ptr<ov::Model>& model,
         const std::filesystem::path& config_dir_path,
         const std::string& device,
         const ov::AnyMap properties);

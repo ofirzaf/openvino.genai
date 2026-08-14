@@ -288,6 +288,22 @@ InputsEmbedderMuseGlimmer::InputsEmbedderMuseGlimmer(const VLMConfig& vlm_config
                                                      const ov::AnyMap device_config)
     : IInputsEmbedder(vlm_config, models_map, tokenizer, config_dir_path, device, device_config) {}
 
+InputsEmbedderMuseGlimmer::InputsEmbedderMuseGlimmer(
+    const VLMConfig& vlm_config,
+    const std::shared_ptr<ov::Model>& text_embeddings_model,
+    const std::shared_ptr<ov::Model>& vision_embeddings_model,
+    const std::filesystem::path& config_dir_path,
+    const Tokenizer& tokenizer,
+    const std::string& device,
+    const ov::AnyMap device_config)
+    : IInputsEmbedder(vlm_config,
+                      text_embeddings_model,
+                      vision_embeddings_model,
+                      config_dir_path,
+                      tokenizer,
+                      device,
+                      device_config) {}
+
 std::vector<EncodedImage> InputsEmbedderMuseGlimmer::encode_images(const std::vector<ov::Tensor>& images) {
     std::vector<EncodedImage> embeds;
     std::vector<ov::Tensor> single_images = to_single_image_tensors(images);

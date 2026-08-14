@@ -9,14 +9,19 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #include <nlohmann/json.hpp>
 
+#include "openvino/op/add.hpp"
 #include "openvino/op/concat.hpp"
 #include "openvino/op/constant.hpp"
 #include "openvino/op/gather.hpp"
 #include "openvino/op/matmul.hpp"
+#include "openvino/op/multiply.hpp"
 #include "openvino/op/parameter.hpp"
+#include "openvino/op/power.hpp"
+#include "openvino/op/reduce_mean.hpp"
 #include "openvino/op/reshape.hpp"
 #include "openvino/op/result.hpp"
 
@@ -32,6 +37,8 @@ namespace {
 
 constexpr const char* DFLASH_HIDDEN_STATES_RT_INFO_KEY = "hidden_states_decoder_layers";
 constexpr const char* LAST_HIDDEN_STATE_OUTPUT_NAME = "last_hidden_state";
+constexpr const char* MUSE_TEXT_EMBEDDINGS_OUTPUT_NAME = "inputs_embeds";
+constexpr const char* MUSE_VISION_EMBEDDINGS_OUTPUT_NAME = "last_hidden_state";
 
 void add_dflash_hidden_state_result(std::shared_ptr<ov::Model>& model,
                                     const std::vector<ov::Output<ov::Node>>& hidden_state_outputs) {
@@ -143,6 +150,280 @@ std::shared_ptr<ov::op::v0::Parameter> find_inputs_embeds_parameter(const std::s
         }
     }
     return nullptr;
+}
+
+bool outputs_match(const ov::Output<ov::Node>& lhs, const ov::Output<ov::Node>& rhs) {
+    return lhs.get_node_shared_ptr() == rhs.get_node_shared_ptr() && lhs.get_index() == rhs.get_index();
+}
+
+template <typename Op>
+std::shared_ptr<Op> expect_op(const ov::Output<ov::Node>& output, const std::string& description) {
+    auto op = ov::as_type_ptr<Op>(output.get_node_shared_ptr());
+    OPENVINO_ASSERT(op, "Muse Glimmer embedding norm must contain ", description, ".");
+    return op;
+}
+
+std::shared_ptr<ov::op::v0::Constant> expect_constant(const ov::Output<ov::Node>& output,
+                                                       const std::string& description) {
+    return expect_op<ov::op::v0::Constant>(output, description);
+}
+
+float get_single_f32_constant(const std::shared_ptr<ov::op::v0::Constant>& constant,
+                              const std::string& description) {
+    OPENVINO_ASSERT(constant->get_element_type() == ov::element::f32,
+                    "Muse Glimmer embedding norm ",
+                    description,
+                    " must be FP32.");
+    const auto values = constant->get_vector<float>();
+    OPENVINO_ASSERT(values.size() == 1,
+                    "Muse Glimmer embedding norm ",
+                    description,
+                    " must contain exactly one value.");
+    return values.front();
+}
+
+void validate_last_axis(const std::shared_ptr<ov::op::v0::Constant>& axes) {
+    std::vector<int64_t> values;
+    if (axes->get_element_type() == ov::element::i64) {
+        values = axes->get_vector<int64_t>();
+    } else if (axes->get_element_type() == ov::element::i32) {
+        const auto values_i32 = axes->get_vector<int32_t>();
+        values.assign(values_i32.begin(), values_i32.end());
+    } else {
+        OPENVINO_THROW("Muse Glimmer embedding norm ReduceMean axes must be i32 or i64.");
+    }
+    OPENVINO_ASSERT(values == std::vector<int64_t>{-1},
+                    "Muse Glimmer embedding norm ReduceMean must reduce only the last axis.");
+}
+
+struct MuseRmsNorm {
+    std::shared_ptr<ov::op::v0::Result> result;
+    ov::Output<ov::Node> raw_activation;
+    std::shared_ptr<ov::op::v1::Power> square;
+    std::shared_ptr<ov::op::v1::ReduceMean> reduce_mean;
+    std::shared_ptr<ov::op::v1::Add> epsilon_add;
+    std::shared_ptr<ov::op::v1::Power> inverse_rms;
+    std::shared_ptr<ov::op::v1::Multiply> multiply;
+    std::shared_ptr<ov::op::v0::Constant> square_exponent;
+    std::shared_ptr<ov::op::v0::Constant> reduce_axes;
+    std::shared_ptr<ov::op::v0::Constant> epsilon;
+    std::shared_ptr<ov::op::v0::Constant> inverse_exponent;
+    size_t multiply_raw_input_index = 0;
+    size_t epsilon_add_reduce_input_index = 0;
+    size_t hidden_size = 0;
+    ov::PartialShape public_shape;
+    ov::element::Type public_type;
+    float square_exponent_value = 0.0f;
+    float epsilon_value = 0.0f;
+    float inverse_exponent_value = 0.0f;
+};
+
+std::shared_ptr<ov::op::v0::Result> find_unique_result(const std::shared_ptr<ov::Model>& model,
+                                                        const std::string& output_name) {
+    std::shared_ptr<ov::op::v0::Result> result;
+    for (const auto& candidate : model->get_results()) {
+        if (candidate->output(0).get_names().count(output_name) == 0) {
+            continue;
+        }
+        OPENVINO_ASSERT(!result,
+                        "Muse Glimmer component has multiple public outputs named '",
+                        output_name,
+                        "'.");
+        result = candidate;
+    }
+    OPENVINO_ASSERT(result, "Muse Glimmer component must expose public output '", output_name, "'.");
+    return result;
+}
+
+MuseRmsNorm match_muse_terminal_rms_norm(const std::shared_ptr<ov::Model>& model,
+                                         const std::string& output_name,
+                                         size_t expected_rank) {
+    OPENVINO_ASSERT(model, "Muse Glimmer embedding component model cannot be null.");
+
+    MuseRmsNorm pattern;
+    pattern.result = find_unique_result(model, output_name);
+    pattern.public_shape = pattern.result->output(0).get_partial_shape();
+    pattern.public_type = pattern.result->output(0).get_element_type();
+
+    pattern.multiply = expect_op<ov::op::v1::Multiply>(
+        pattern.result->input_value(0), "terminal Multiply(raw_activation, inverse_rms)");
+    OPENVINO_ASSERT(pattern.multiply->get_input_size() == 2,
+                    "Muse Glimmer terminal RMSNorm Multiply must have two inputs.");
+
+    const auto first_inverse = ov::as_type_ptr<ov::op::v1::Power>(
+        pattern.multiply->input_value(0).get_node_shared_ptr());
+    const auto second_inverse = ov::as_type_ptr<ov::op::v1::Power>(
+        pattern.multiply->input_value(1).get_node_shared_ptr());
+    OPENVINO_ASSERT(static_cast<bool>(first_inverse) != static_cast<bool>(second_inverse),
+                    "Muse Glimmer terminal RMSNorm Multiply must have exactly one inverse-RMS Power input.");
+    const size_t inverse_input_index = first_inverse ? 0 : 1;
+    pattern.multiply_raw_input_index = inverse_input_index == 0 ? 1 : 0;
+    pattern.inverse_rms = first_inverse ? first_inverse : second_inverse;
+    pattern.raw_activation = pattern.multiply->input_value(pattern.multiply_raw_input_index);
+
+    OPENVINO_ASSERT(pattern.inverse_rms->get_input_size() == 2,
+                    "Muse Glimmer inverse-RMS Power must have two inputs.");
+    pattern.epsilon_add =
+        expect_op<ov::op::v1::Add>(pattern.inverse_rms->input_value(0), "inverse-RMS Power input Add");
+    pattern.inverse_exponent =
+        expect_constant(pattern.inverse_rms->input_value(1), "inverse-RMS Power exponent Constant");
+
+    OPENVINO_ASSERT(pattern.epsilon_add->get_input_size() == 2,
+                    "Muse Glimmer RMSNorm epsilon Add must have two inputs.");
+    const auto first_reduce = ov::as_type_ptr<ov::op::v1::ReduceMean>(
+        pattern.epsilon_add->input_value(0).get_node_shared_ptr());
+    const auto second_reduce = ov::as_type_ptr<ov::op::v1::ReduceMean>(
+        pattern.epsilon_add->input_value(1).get_node_shared_ptr());
+    OPENVINO_ASSERT(static_cast<bool>(first_reduce) != static_cast<bool>(second_reduce),
+                    "Muse Glimmer RMSNorm epsilon Add must have exactly one ReduceMean input.");
+    pattern.epsilon_add_reduce_input_index = first_reduce ? 0 : 1;
+    pattern.reduce_mean = first_reduce ? first_reduce : second_reduce;
+    pattern.epsilon = expect_constant(
+        pattern.epsilon_add->input_value(pattern.epsilon_add_reduce_input_index == 0 ? 1 : 0),
+        "RMSNorm epsilon Constant");
+
+    OPENVINO_ASSERT(pattern.reduce_mean->get_input_size() == 2,
+                    "Muse Glimmer RMSNorm ReduceMean must have data and axes inputs.");
+    OPENVINO_ASSERT(pattern.reduce_mean->get_keep_dims(),
+                    "Muse Glimmer RMSNorm ReduceMean must preserve reduced dimensions.");
+    pattern.square = expect_op<ov::op::v1::Power>(
+        pattern.reduce_mean->input_value(0), "RMSNorm square Power");
+    pattern.reduce_axes = expect_constant(pattern.reduce_mean->input_value(1), "RMSNorm ReduceMean axes Constant");
+
+    OPENVINO_ASSERT(pattern.square->get_input_size() == 2,
+                    "Muse Glimmer RMSNorm square Power must have two inputs.");
+    OPENVINO_ASSERT(outputs_match(pattern.square->input_value(0), pattern.raw_activation),
+                    "Muse Glimmer RMSNorm square Power must consume the terminal Multiply raw activation.");
+    pattern.square_exponent = expect_constant(pattern.square->input_value(1), "RMSNorm square Power exponent Constant");
+
+    pattern.square_exponent_value = get_single_f32_constant(pattern.square_exponent, "square exponent");
+    pattern.epsilon_value = get_single_f32_constant(pattern.epsilon, "epsilon");
+    pattern.inverse_exponent_value = get_single_f32_constant(pattern.inverse_exponent, "inverse exponent");
+    OPENVINO_ASSERT(pattern.square_exponent_value == 2.0f,
+                    "Muse Glimmer RMSNorm square exponent must equal 2.");
+    OPENVINO_ASSERT(pattern.inverse_exponent_value == -0.5f,
+                    "Muse Glimmer RMSNorm inverse exponent must equal -0.5.");
+    validate_last_axis(pattern.reduce_axes);
+
+    const auto raw_shape = pattern.raw_activation.get_partial_shape();
+    OPENVINO_ASSERT(raw_shape.rank().is_static() && raw_shape.rank().get_length() == expected_rank,
+                    "Muse Glimmer component '",
+                    output_name,
+                    "' raw activation must have rank ",
+                    expected_rank,
+                    ".");
+    OPENVINO_ASSERT(raw_shape[expected_rank - 1].is_static(),
+                    "Muse Glimmer component '",
+                    output_name,
+                    "' raw activation hidden width must be static.");
+    pattern.hidden_size = static_cast<size_t>(raw_shape[expected_rank - 1].get_length());
+
+    OPENVINO_ASSERT(pattern.raw_activation.get_element_type() == ov::element::f32 &&
+                        pattern.square->output(0).get_element_type() == ov::element::f32 &&
+                        pattern.reduce_mean->output(0).get_element_type() == ov::element::f32 &&
+                        pattern.epsilon_add->output(0).get_element_type() == ov::element::f32 &&
+                        pattern.inverse_rms->output(0).get_element_type() == ov::element::f32 &&
+                        pattern.multiply->output(0).get_element_type() == ov::element::f32 &&
+                        pattern.public_type == ov::element::f32,
+                    "Muse Glimmer terminal RMSNorm must use FP32 activations and statistics.");
+    OPENVINO_ASSERT(pattern.public_shape == raw_shape,
+                    "Muse Glimmer component '",
+                    output_name,
+                    "' terminal RMSNorm must preserve its public output shape.");
+    return pattern;
+}
+
+void validate_equivalent_norms(const MuseRmsNorm& text, const MuseRmsNorm& vision) {
+    OPENVINO_ASSERT(text.hidden_size == vision.hidden_size,
+                    "Muse Glimmer text and vision embedding hidden widths must match.");
+    OPENVINO_ASSERT(text.square_exponent_value == vision.square_exponent_value &&
+                        text.epsilon_value == vision.epsilon_value &&
+                        text.inverse_exponent_value == vision.inverse_exponent_value,
+                    "Muse Glimmer text and vision terminal RMSNorm constants must match.");
+    OPENVINO_ASSERT(text.reduce_mean->get_keep_dims() == vision.reduce_mean->get_keep_dims(),
+                    "Muse Glimmer text and vision terminal RMSNorm ReduceMean attributes must match.");
+}
+
+std::shared_ptr<ov::op::v0::Parameter> find_unique_inputs_embeds_parameter(
+    const std::shared_ptr<ov::Model>& model) {
+    std::shared_ptr<ov::op::v0::Parameter> parameter;
+    for (const auto& candidate : model->get_parameters()) {
+        if (candidate->output(0).get_names().count(MUSE_TEXT_EMBEDDINGS_OUTPUT_NAME) == 0) {
+            continue;
+        }
+        OPENVINO_ASSERT(!parameter,
+                        "Muse Glimmer language model has multiple public inputs named 'inputs_embeds'.");
+        parameter = candidate;
+    }
+    OPENVINO_ASSERT(parameter, "Muse Glimmer language model must expose public input 'inputs_embeds'.");
+    return parameter;
+}
+
+std::vector<ov::Input<ov::Node>> snapshot_live_consumers(
+    const std::shared_ptr<ov::Model>& model,
+    const std::shared_ptr<ov::op::v0::Parameter>& parameter) {
+    std::unordered_set<const ov::Node*> live_nodes;
+    for (const auto& node : model->get_ordered_ops()) {
+        live_nodes.insert(node.get());
+    }
+
+    std::vector<ov::Input<ov::Node>> consumers;
+    for (auto consumer : parameter->output(0).get_target_inputs()) {
+        if (live_nodes.count(consumer.get_node()) != 0) {
+            consumers.push_back(consumer);
+        }
+    }
+    OPENVINO_ASSERT(!consumers.empty(),
+                    "Muse Glimmer language-model inputs_embeds input has no live consumers.");
+    return consumers;
+}
+
+std::shared_ptr<ov::op::v0::Constant> clone_constant(const std::shared_ptr<ov::op::v0::Constant>& constant) {
+    return std::make_shared<ov::op::v0::Constant>(
+        constant->get_element_type(), constant->get_shape(), constant->get_data_ptr());
+}
+
+ov::Output<ov::Node> clone_operation(const std::shared_ptr<ov::Node>& operation,
+                                     const ov::OutputVector& inputs,
+                                     const std::string& friendly_name) {
+    auto clone = operation->clone_with_new_inputs(inputs);
+    clone->set_friendly_name(friendly_name);
+    return clone->output(0);
+}
+
+ov::Output<ov::Node> clone_muse_rms_norm_on_language_input(
+    const MuseRmsNorm& norm,
+    const std::shared_ptr<ov::op::v0::Parameter>& language_inputs_embeds) {
+    const auto raw_input = language_inputs_embeds->output(0);
+
+    ov::OutputVector square_inputs{norm.square->input_value(0), norm.square->input_value(1)};
+    square_inputs[0] = raw_input;
+    square_inputs[1] = clone_constant(norm.square_exponent)->output(0);
+    const auto square = clone_operation(
+        norm.square, square_inputs, "dflash_muse_embedding_norm_square");
+
+    ov::OutputVector reduce_inputs{norm.reduce_mean->input_value(0), norm.reduce_mean->input_value(1)};
+    reduce_inputs[0] = square;
+    reduce_inputs[1] = clone_constant(norm.reduce_axes)->output(0);
+    const auto reduce_mean = clone_operation(
+        norm.reduce_mean, reduce_inputs, "dflash_muse_embedding_norm_reduce_mean");
+
+    ov::OutputVector add_inputs{norm.epsilon_add->input_value(0), norm.epsilon_add->input_value(1)};
+    add_inputs[norm.epsilon_add_reduce_input_index] = reduce_mean;
+    add_inputs[norm.epsilon_add_reduce_input_index == 0 ? 1 : 0] = clone_constant(norm.epsilon)->output(0);
+    const auto epsilon_add = clone_operation(
+        norm.epsilon_add, add_inputs, "dflash_muse_embedding_norm_add_epsilon");
+
+    ov::OutputVector inverse_inputs{norm.inverse_rms->input_value(0), norm.inverse_rms->input_value(1)};
+    inverse_inputs[0] = epsilon_add;
+    inverse_inputs[1] = clone_constant(norm.inverse_exponent)->output(0);
+    const auto inverse_rms = clone_operation(
+        norm.inverse_rms, inverse_inputs, "dflash_muse_embedding_norm_inverse_rms");
+
+    ov::OutputVector multiply_inputs{norm.multiply->input_value(0), norm.multiply->input_value(1)};
+    multiply_inputs[norm.multiply_raw_input_index] = raw_input;
+    multiply_inputs[norm.multiply_raw_input_index == 0 ? 1 : 0] = inverse_rms;
+    return clone_operation(norm.multiply, multiply_inputs, "dflash_muse_embedding_norm");
 }
 
 }  // namespace
@@ -269,6 +550,55 @@ DFlashRTInfo extract_dflash_info_from_config(ov::AnyMap& config) {
     OPENVINO_ASSERT(!info.target_layer_ids.empty(), "DFlash target_layer_ids cannot be empty.");
 
     return info;
+}
+
+void hoist_muse_glimmer_embedding_norms(const std::shared_ptr<ov::Model>& language_model,
+                                        const std::shared_ptr<ov::Model>& text_embeddings_model,
+                                        const std::shared_ptr<ov::Model>& vision_embeddings_model,
+                                        float scale_emb) {
+    OPENVINO_ASSERT(language_model && text_embeddings_model && vision_embeddings_model,
+                    "Muse Glimmer DFlash embedding-norm relocation requires language, text, and vision models.");
+    OPENVINO_ASSERT(scale_emb == 1.0f,
+                    "Muse Glimmer DFlash embedding-norm relocation requires scale_emb == 1, got ",
+                    scale_emb,
+                    ".");
+
+    // Inspect every graph before changing any of them.
+    const auto text_norm =
+        match_muse_terminal_rms_norm(text_embeddings_model, MUSE_TEXT_EMBEDDINGS_OUTPUT_NAME, 3);
+    const auto vision_norm =
+        match_muse_terminal_rms_norm(vision_embeddings_model, MUSE_VISION_EMBEDDINGS_OUTPUT_NAME, 2);
+    validate_equivalent_norms(text_norm, vision_norm);
+
+    const auto language_inputs_embeds = find_unique_inputs_embeds_parameter(language_model);
+    const auto language_shape = language_inputs_embeds->output(0).get_partial_shape();
+    OPENVINO_ASSERT(language_shape.rank().is_static() && language_shape.rank().get_length() == 3,
+                    "Muse Glimmer language-model inputs_embeds input must be rank 3.");
+    OPENVINO_ASSERT(language_shape[2].is_static() &&
+                        static_cast<size_t>(language_shape[2].get_length()) == text_norm.hidden_size,
+                    "Muse Glimmer language-model inputs_embeds hidden width must match component embeddings.");
+    OPENVINO_ASSERT(language_inputs_embeds->output(0).get_element_type() == ov::element::f32,
+                    "Muse Glimmer language-model inputs_embeds input must be FP32.");
+    const auto original_language_consumers = snapshot_live_consumers(language_model, language_inputs_embeds);
+
+    // Only begin rewiring after all structural checks above have passed.
+    const auto hoisted_norm = clone_muse_rms_norm_on_language_input(text_norm, language_inputs_embeds);
+    text_norm.result->input(0).replace_source_output(text_norm.raw_activation);
+    vision_norm.result->input(0).replace_source_output(vision_norm.raw_activation);
+    for (auto consumer : original_language_consumers) {
+        consumer.replace_source_output(hoisted_norm);
+    }
+
+    text_embeddings_model->validate_nodes_and_infer_types();
+    vision_embeddings_model->validate_nodes_and_infer_types();
+    language_model->validate_nodes_and_infer_types();
+
+    OPENVINO_ASSERT(text_norm.result->output(0).get_partial_shape() == text_norm.public_shape &&
+                        text_norm.result->output(0).get_element_type() == text_norm.public_type,
+                    "Muse Glimmer text embedding public output changed during norm relocation.");
+    OPENVINO_ASSERT(vision_norm.result->output(0).get_partial_shape() == vision_norm.public_shape &&
+                        vision_norm.result->output(0).get_element_type() == vision_norm.public_type,
+                    "Muse Glimmer vision embedding public output changed during norm relocation.");
 }
 
 void reshape_draft_hidden_states_input_for_cb(std::shared_ptr<ov::Model>& model) {
