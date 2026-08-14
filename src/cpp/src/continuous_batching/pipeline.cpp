@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <mutex>
 #include <memory>
+#include <optional>
 #include <openvino/runtime/properties.hpp>
 
 #include "openvino/genai/continuous_batching_pipeline.hpp"
@@ -45,6 +46,19 @@ float get_load_time(std::chrono::steady_clock::time_point start_time) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(stop_time - start_time).count();
 }
 
+std::optional<VLMConfig> get_muse_glimmer_dflash_config(
+    const std::filesystem::path& config_dir_path,
+    const utils::dflash::DFlashRTInfo& dflash_rt_info) {
+    if (!dflash_rt_info.dflash_mode) {
+        return std::nullopt;
+    }
+    auto vlm_config = utils::from_config_json_if_exists<VLMConfig>(config_dir_path, "config.json");
+    if (vlm_config.model_type != VLMModelType::MUSE_GLIMMER) {
+        return std::nullopt;
+    }
+    return vlm_config;
+}
+
 std::shared_ptr<InputsEmbedder> create_inputs_embedder_from_path(
     const std::shared_ptr<ov::Model>& language_model,
     const std::filesystem::path& model_dir,
@@ -52,12 +66,8 @@ std::shared_ptr<InputsEmbedder> create_inputs_embedder_from_path(
     const std::string& device,
     const ov::AnyMap& properties,
     const utils::dflash::DFlashRTInfo& dflash_rt_info) {
-    if (!dflash_rt_info.dflash_mode) {
-        return std::make_shared<InputsEmbedder>(model_dir, tokenizer, device, properties);
-    }
-
-    const auto vlm_config = utils::from_config_json_if_exists<VLMConfig>(model_dir, "config.json");
-    if (vlm_config.model_type != VLMModelType::MUSE_GLIMMER) {
+    const auto vlm_config = get_muse_glimmer_dflash_config(model_dir, dflash_rt_info);
+    if (!vlm_config) {
         return std::make_shared<InputsEmbedder>(model_dir, tokenizer, device, properties);
     }
 
@@ -71,7 +81,7 @@ std::shared_ptr<InputsEmbedder> create_inputs_embedder_from_path(
     auto text_embeddings_model = core.read_model(text_embeddings_path, {}, text_properties);
     auto vision_embeddings_model = core.read_model(vision_embeddings_path);
     utils::dflash::hoist_muse_glimmer_embedding_norms(
-        language_model, text_embeddings_model, vision_embeddings_model, vlm_config.scale_emb);
+        language_model, text_embeddings_model, vision_embeddings_model, vlm_config->scale_emb);
     return std::make_shared<InputsEmbedder>(
         model_dir, tokenizer, text_embeddings_model, vision_embeddings_model, device, properties);
 }
@@ -84,12 +94,8 @@ std::shared_ptr<InputsEmbedder> create_inputs_embedder_from_models_map(
     const std::string& device,
     const ov::AnyMap& properties,
     const utils::dflash::DFlashRTInfo& dflash_rt_info) {
-    if (!dflash_rt_info.dflash_mode) {
-        return std::make_shared<InputsEmbedder>(models_map, tokenizer, config_dir_path, device, properties);
-    }
-
-    const auto vlm_config = utils::from_config_json_if_exists<VLMConfig>(config_dir_path, "config.json");
-    if (vlm_config.model_type != VLMModelType::MUSE_GLIMMER) {
+    const auto vlm_config = get_muse_glimmer_dflash_config(config_dir_path, dflash_rt_info);
+    if (!vlm_config) {
         return std::make_shared<InputsEmbedder>(models_map, tokenizer, config_dir_path, device, properties);
     }
 
@@ -99,7 +105,7 @@ std::shared_ptr<InputsEmbedder> create_inputs_embedder_from_models_map(
     auto text_embeddings_model = core.read_model(text_model, text_weights);
     auto vision_embeddings_model = core.read_model(vision_model, vision_weights);
     utils::dflash::hoist_muse_glimmer_embedding_norms(
-        language_model, text_embeddings_model, vision_embeddings_model, vlm_config.scale_emb);
+        language_model, text_embeddings_model, vision_embeddings_model, vlm_config->scale_emb);
     return std::make_shared<InputsEmbedder>(
         config_dir_path, tokenizer, text_embeddings_model, vision_embeddings_model, device, properties);
 }
