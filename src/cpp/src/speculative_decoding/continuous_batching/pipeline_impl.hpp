@@ -58,6 +58,26 @@ public:
     void sync_generated_embeddings();
     bool is_requests_empty();
 
+    // Retain request lifecycle and sequence state even after completion removes
+    // it from a step's generated-output map.
+    SequenceGroup::Ptr find_request(uint64_t request_id) const {
+        for (const auto& request : m_requests)
+            if (request->get_request_id() == request_id)
+                return request;
+        for (const auto& request : m_awaiting_requests)
+            if (request->get_request_id() == request_id)
+                return request;
+        return nullptr;
+    }
+
+    void disable_preemption() { m_scheduler->disable_preemption(); }
+    void defer_oom_while_draft_synchronizes() { m_defer_oom_on_waiting_requests = true; }
+    void cleanup_finished_requests() {
+        _notify_requests_dropped_by_handle();
+        _free_non_running_requests();
+    }
+    size_t max_batched_tokens() const { return m_scheduler->get_config().max_num_batched_tokens; }
+
     size_t get_processed_tokens_per_iteration();
 
     // Rewinds an awaiting request to an earlier processed-prefix position and synchronizes

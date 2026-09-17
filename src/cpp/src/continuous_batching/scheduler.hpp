@@ -45,6 +45,7 @@ public:
 
 private:
     bool m_can_use_partial_preemption;
+    bool m_allow_preemption = true;
 
     SchedulerConfig m_config;
     std::shared_ptr<const KVPagedAttentionGlobalData> m_kv_paged_attention_global_data;
@@ -292,6 +293,8 @@ public:
         m_cache_orchestrator.reset();
     }
 
+    void disable_preemption() { m_allow_preemption = false; }
+
     Output schedule(std::vector<SequenceGroup::Ptr>& sequence_groups) {
         _validate_linear_attention_paging_modes(sequence_groups);
 
@@ -345,6 +348,47 @@ public:
         m_cache_orchestrator->copy_blocks(typed_block_copy_map);
         linear_attention_reservations.disarm();
         return scheduler_output;
+    }
+
+    // Schedule explicitly sized, indivisible cache appends. Query/output lengths
+    // are deliberately absent: asymmetric attention can produce fewer rows than
+    // it appends. Committed pages are never preempted by this scheduling path.
+    Output schedule_append(std::vector<SequenceGroup::Ptr>& groups,
+                           const std::map<uint64_t, size_t>& cache_rows) {
+        OPENVINO_ASSERT(!m_config.enable_prefix_caching && !m_config.use_cache_eviction &&
+                            !m_config.use_sparse_attention && !has_linear_attention_cache(),
+                        "Explicit cache appends require unshared, non-evicting KV caches");
+        clean_empty_blocks(groups);
+        if (!m_cache_orchestrator->has_token_capacity())
+            _initialize_cache(groups);
+        Output output;
+        output.set_kv_paged_attention_global_data(m_kv_paged_attention_global_data);
+        for (size_t i = 0; i < groups.size(); ++i) {
+            auto& group = groups[i];
+            auto rows = cache_rows.find(group->get_request_id());
+            if (rows == cache_rows.end() || rows->second == 0)
+                continue;
+            OPENVINO_ASSERT(group->num_running_seqs() == 1 && group->get_num_scheduled_tokens() == 0);
+            if (output.m_scheduled_sequence_groups_ids.size() >= m_config.max_num_seqs ||
+                rows->second > m_config.max_num_batched_tokens - output.m_total_num_scheduled_tokens)
+                continue;
+            group->schedule_tokens(rows->second);
+            while (!m_cache_orchestrator->can_append_slots(group) && _try_increase_cache(group)) {}
+            if (!m_cache_orchestrator->can_append_slots(group)) {
+                group->clear_scheduled_tokens();
+                continue;
+            }
+            const auto copies = m_cache_orchestrator->append_slots(group);
+            OPENVINO_ASSERT(copies.empty(), "Unshared cache append unexpectedly requested copy-on-write");
+            const auto seq_id = group->get_running_sequences().front()->get_id();
+            output.set_kv_block_tables(seq_id, m_cache_orchestrator->get_kv_block_tables(seq_id));
+            output.m_scheduled_sequence_groups_ids.push_back(i);
+            output.m_total_num_scheduled_tokens += rows->second;
+        }
+        m_cache_orchestrator->allocate_cache_if_needed();
+        output.m_cache_usage = m_cache_orchestrator->get_used_percentage();
+        output.m_cache_size_in_bytes = m_cache_orchestrator->get_total_cache_size_in_bytes();
+        return output;
     }
 
     /**
@@ -557,6 +601,8 @@ private:
     }
 
     void _apply_preemption(size_t sequence_group_id, const std::vector<SequenceGroup::Ptr>& sequence_groups) {
+        if (!m_allow_preemption)
+            return;
         SequenceGroup::Ptr sequence_group = sequence_groups[sequence_group_id];
 
         // check whether current sequence requires a new slot / block

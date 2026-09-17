@@ -192,6 +192,23 @@ TEST(DFlashCBHiddenDeltaBuffer, MergesChunksInOrder) {
     ASSERT_EQ(tensor_values(materialized), (std::vector<float>{0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f}));
 }
 
+TEST(DFlashCBHiddenDeltaBuffer, OwnsPendingRangesAcrossChunkConsumption) {
+    ov::genai::dflash_cb::HiddenDeltaBuffer buffer;
+    auto first = make_token_major_hidden_delta(3, 2, 0.f);
+    buffer.append(first, true);
+    std::fill_n(first.data<float>(), first.get_size(), -99.f);
+    buffer.append(make_token_major_hidden_delta(2, 2, 6.f), true);
+    EXPECT_EQ(tensor_values(buffer.prefix(4)), (std::vector<float>{0, 1, 2, 3, 4, 5, 6, 7}));
+    buffer.consume(2);
+    EXPECT_EQ(buffer.token_count(), 3);
+    EXPECT_EQ(tensor_values(buffer.prefix(2)), (std::vector<float>{4, 5, 6, 7}));
+    buffer.consume(2);
+    EXPECT_EQ(tensor_values(buffer.prefix(1)), (std::vector<float>{8, 9}));
+    buffer.consume(1);
+    EXPECT_TRUE(buffer.empty());
+    EXPECT_THROW(buffer.consume(1), ov::Exception);
+}
+
 TEST(DFlashModelTransforms, AppliesAndExtractsDraftRtInfo) {
     auto model = make_annotated_stateful_sdpa_model();
     model->set_rt_info(true, "dflash_mode");

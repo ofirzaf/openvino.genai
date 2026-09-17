@@ -388,7 +388,11 @@ void attach_target_embedding_to_draft(const std::shared_ptr<ov::Model>& main_mod
     }
     OPENVINO_ASSERT(!original_consumers.empty(), "DFlash draft inputs_embeds input has no live consumers.");
 
-    auto input_ids = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{-1, -1});
+    const auto embed_rank = inputs_embeds_param->get_partial_shape().rank();
+    OPENVINO_ASSERT(embed_rank == 2 || embed_rank == 3,
+                    "DFlash embeddings must be packed rows or a batch of rows");
+    auto input_ids = std::make_shared<ov::op::v0::Parameter>(
+        ov::element::i64, embed_rank == 2 ? ov::PartialShape{-1} : ov::PartialShape{-1, -1});
     input_ids->set_friendly_name("input_ids");
     input_ids->output(0).set_names({"input_ids"});
 

@@ -412,6 +412,45 @@ public:
         return m_request;
     }
 
+    // Asymmetric callers pack model-specific rows independently from cache
+    // scheduling. Cache allocation remains owned by Scheduler/CacheOrchestrator.
+    ov::Tensor forward_asymmetric(const std::vector<SequenceGroup::Ptr>& groups,
+                                 const Scheduler::Output& schedule,
+                                 const std::map<std::string, ov::Tensor>& inputs) {
+        std::vector<int32_t> past, kv_begins{0}, pages, page_begins{0};
+        size_t max_context = 0;
+        for (auto index : schedule.m_scheduled_sequence_groups_ids) {
+            const auto& group = groups.at(index);
+            const auto seq_id = group->get_running_sequences().front()->get_id();
+            const auto context = group->get_context_len();
+            OPENVINO_ASSERT(context <= static_cast<size_t>(std::numeric_limits<int32_t>::max()));
+            past.push_back(static_cast<int32_t>(group->get_num_processed_tokens()));
+            kv_begins.push_back(kv_begins.back() + static_cast<int32_t>(group->get_num_scheduled_tokens()));
+            const auto& tables = schedule.get_kv_block_tables(seq_id);
+            OPENVINO_ASSERT(tables.size() == 1, "Asymmetric forward requires shared per-layer block indices");
+            for (const auto& page : tables.front())
+                pages.push_back(static_cast<int32_t>(page->get_index()));
+            page_begins.push_back(static_cast<int32_t>(pages.size()));
+            max_context = std::max(max_context, context);
+        }
+        auto bind_i32 = [&](const char* name, const std::vector<int32_t>& values) {
+            ov::Tensor tensor(ov::element::i32, {values.size()});
+            std::copy(values.begin(), values.end(), tensor.data<int32_t>());
+            m_request.set_tensor(name, tensor);
+        };
+        bind_i32("past_lens", past);
+        bind_i32("subsequence_begins", kv_begins);
+        bind_i32("block_indices", pages);
+        bind_i32("block_indices_begins", page_begins);
+        ov::Tensor max_length(ov::element::i32, {});
+        max_length.data<int32_t>()[0] = static_cast<int32_t>(max_context);
+        m_request.set_tensor("max_context_len", max_length);
+        for (const auto& [name, tensor] : inputs)
+            m_request.set_tensor(name, tensor);
+        m_request.infer();
+        return m_request.get_tensor("logits");
+    }
+
     void enable_hidden_state_export(bool on)   { on ? m_hidden_state_flags |= HS_EXPORT   : m_hidden_state_flags &= ~HS_EXPORT; }
     void enable_hidden_state_import(bool on)   { on ? m_hidden_state_flags |= HS_IMPORT   : m_hidden_state_flags &= ~HS_IMPORT; }
     void enable_hidden_state_internal(bool on) { on ? m_hidden_state_flags |= HS_INTERNAL : m_hidden_state_flags &= ~HS_INTERNAL; }

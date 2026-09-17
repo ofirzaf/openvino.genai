@@ -75,6 +75,16 @@ void expose_target_hidden_states(std::shared_ptr<ov::Model>& model,
 void reshape_draft_hidden_states_input_for_cb(std::shared_ptr<ov::Model>& model);
 
 /**
+ * @brief Validates and converts an append-all DFlash draft to packed PagedAttention.
+ *
+ * Prepares DFlash layouts, RoPE and candidate gathers, then invokes the generic
+ * OpenVINO pass. Adds an internal token_type_ids input for current-KV rows; GenAI
+ * supplies zero for target-hidden deltas and one for proposal rows. The exported
+ * IR and the public generation API do not need a token-type input.
+ */
+void convert_draft_to_paged_attention(const std::shared_ptr<ov::Model>& model);
+
+/**
  * @brief Grafts the target lm_head onto the draft model.
  *
  * Clones only the weight side (input(1)) of the target's final lm_head MatMul - including any INT4

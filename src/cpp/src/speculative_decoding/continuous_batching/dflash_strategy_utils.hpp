@@ -84,6 +84,39 @@ public:
         return m_token_count;
     }
 
+    ov::Tensor prefix(size_t count) const {
+        OPENVINO_ASSERT(count > 0 && count <= m_token_count);
+        auto shape = m_chunks.front().get_shape();
+        shape[0] = count;
+        ov::Tensor result(m_chunks.front().get_element_type(), shape);
+        size_t offset = 0;
+        for (const auto& chunk : m_chunks) {
+            const size_t rows = std::min(count - offset, chunk.get_shape()[0]);
+            ov::Tensor src(chunk, {0, 0, 0}, {rows, 1, shape[2]});
+            ov::Tensor dst(result, {offset, 0, 0}, {offset + rows, 1, shape[2]});
+            src.copy_to(dst);
+            offset += rows;
+            if (offset == count)
+                break;
+        }
+        return result;
+    }
+
+    void consume(size_t count) {
+        OPENVINO_ASSERT(count <= m_token_count);
+        m_token_count -= count;
+        while (count > 0) {
+            const auto shape = m_chunks.front().get_shape();
+            if (count >= shape[0]) {
+                count -= shape[0];
+                m_chunks.erase(m_chunks.begin());
+            } else {
+                m_chunks.front() = ov::Tensor(m_chunks.front(), {count, 0, 0}, {shape[0], 1, shape[2]});
+                count = 0;
+            }
+        }
+    }
+
     ov::Tensor materialize() const {
         OPENVINO_ASSERT(m_token_count > 0, "Cannot materialize empty DFlash hidden deltas.");
         OPENVINO_ASSERT(!m_chunks.empty(), "DFlash hidden delta chunks are empty.");

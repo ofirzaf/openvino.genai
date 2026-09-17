@@ -38,6 +38,9 @@ protected:
 
     // flag to enable validation mode for sampler
     bool m_is_validation_mode_enabled = false;
+    // A cooperating draft pipeline can pause requests while it synchronizes.
+    // Those requests may later finish and release target cache capacity.
+    bool m_defer_oom_on_waiting_requests = false;
 
     size_t m_num_decoder_layers = 0;
 

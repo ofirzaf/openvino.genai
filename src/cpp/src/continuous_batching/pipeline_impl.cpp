@@ -510,6 +510,15 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
 
     // if no tokens were scheduled, we are out of memory => free all requests and return
     if (scheduler_output.m_total_num_scheduled_tokens == 0) {
+        if (m_defer_oom_on_waiting_requests &&
+            std::any_of(m_requests.begin(), m_requests.end(), [](const auto& request) {
+                return request->is_waiting() && !request->has_finished() &&
+                       !request->handle_cancelled() && !request->handle_stopped();
+            })) {
+            _notify_requests_dropped_by_handle();
+            _free_non_running_requests();
+            return;
+        }
         for (size_t i = 0; i < m_requests.size(); ++i) {
             SequenceGroup::Ptr sequence_group = m_requests[i];
             if (!sequence_group->is_waiting()) {
