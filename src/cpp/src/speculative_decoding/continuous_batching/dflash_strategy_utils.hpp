@@ -5,14 +5,17 @@
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <vector>
 
 #include <openvino/core/except.hpp>
 #include <openvino/runtime/tensor.hpp>
 
 #include "openvino/genai/generation_config.hpp"
+#include "sequence_group.hpp"
 
 namespace ov::genai::dflash_cb {
 
@@ -125,6 +128,242 @@ private:
     std::vector<ov::Tensor> m_chunks;
     size_t m_token_count = 0;
 };
+
+using PerLayerEmbeddingsCallback = std::function<ov::Tensor(const ov::Tensor&)>;
+
+namespace detail {
+
+inline bool tensors_equal(const ov::Tensor& lhs, const ov::Tensor& rhs) {
+    if (!lhs || !rhs) {
+        return !lhs && !rhs;
+    }
+    if (lhs.get_element_type() != rhs.get_element_type() || lhs.get_shape() != rhs.get_shape() ||
+        lhs.get_byte_size() != rhs.get_byte_size()) {
+        return false;
+    }
+    return lhs.get_byte_size() == 0 || std::memcmp(lhs.data(), rhs.data(), lhs.get_byte_size()) == 0;
+}
+
+inline bool embedding_rows_equal(const std::vector<float>& lhs, const std::vector<float>& rhs) {
+    return lhs.size() == rhs.size() &&
+           (lhs.empty() || std::memcmp(lhs.data(), rhs.data(), lhs.size() * sizeof(float)) == 0);
+}
+
+inline std::optional<int64_t> token_type_at(const std::optional<std::vector<int64_t>>& token_types,
+                                            size_t index,
+                                            size_t prompt_length) {
+    if (index >= prompt_length || !token_types) {
+        return int64_t{0};
+    }
+    if (index >= token_types->size()) {
+        return std::nullopt;
+    }
+    return (*token_types)[index];
+}
+
+inline bool is_visual_row(const std::optional<std::vector<int64_t>>& token_types, size_t index, size_t prompt_length) {
+    const auto token_type = token_type_at(token_types, index, prompt_length);
+    return token_type.has_value() && *token_type != 0;
+}
+
+inline size_t visual_span_start(const std::optional<std::vector<int64_t>>& token_types,
+                                size_t index,
+                                size_t prompt_length) {
+    if (!is_visual_row(token_types, index, prompt_length)) {
+        return index;
+    }
+    while (index > 0 && is_visual_row(token_types, index - 1, prompt_length)) {
+        --index;
+    }
+    return index;
+}
+
+inline size_t visual_span_end(const std::optional<std::vector<int64_t>>& token_types,
+                              size_t index,
+                              size_t prompt_length) {
+    while (index < prompt_length && is_visual_row(token_types, index, prompt_length)) {
+        ++index;
+    }
+    return index;
+}
+
+inline bool has_per_layer_inputs(const ov::Tensor& tensor) {
+    return tensor && tensor.get_size() != 0;
+}
+
+inline bool has_valid_per_layer_layout(const ov::Tensor& tensor) {
+    if (!tensor) {
+        return false;
+    }
+    const auto shape = tensor.get_shape();
+    return tensor.get_element_type() == ov::element::f32 && shape.size() == 4 && shape[0] == 1;
+}
+
+inline bool per_layer_layouts_match(const ov::Tensor& lhs, const ov::Tensor& rhs) {
+    if (!has_valid_per_layer_layout(lhs) || !has_valid_per_layer_layout(rhs)) {
+        return false;
+    }
+    const auto lhs_shape = lhs.get_shape();
+    const auto rhs_shape = rhs.get_shape();
+    return lhs_shape[2] == rhs_shape[2] && lhs_shape[3] == rhs_shape[3];
+}
+
+inline bool per_layer_rows_equal(const ov::Tensor& lhs, size_t lhs_row, const ov::Tensor& rhs, size_t rhs_row) {
+    if (!per_layer_layouts_match(lhs, rhs)) {
+        return false;
+    }
+    const auto lhs_shape = lhs.get_shape();
+    const auto rhs_shape = rhs.get_shape();
+    if (lhs_row >= lhs_shape[1] || rhs_row >= rhs_shape[1]) {
+        return false;
+    }
+    const size_t row_elements = lhs_shape[2] * lhs_shape[3];
+    const auto* lhs_data = lhs.data<const float>() + lhs_row * row_elements;
+    const auto* rhs_data = rhs.data<const float>() + rhs_row * row_elements;
+    return row_elements == 0 || std::memcmp(lhs_data, rhs_data, row_elements * sizeof(float)) == 0;
+}
+
+}  // namespace detail
+
+// Returns the reusable logical prefix shared by the retained target request and a new target request.
+// DFlash keeps a single draft InferRequest state; it does not maintain a draft hash table.
+inline size_t last_owner_lcp(const SequenceGroup::CPtr& owner,
+                             const SequenceGroup::CPtr& current,
+                             size_t limit,
+                             const PerLayerEmbeddingsCallback& per_layer_embeddings_callback = {}) {
+    if (!owner || !current || limit == 0 || owner->get_sequence_group_type() != current->get_sequence_group_type() ||
+        owner->get_sequences().size() != 1 || current->get_sequences().size() != 1) {
+        return 0;
+    }
+
+    const auto owner_sequence = owner->get_sequences().front();
+    const auto current_sequence = current->get_sequences().front();
+    const size_t owner_prompt_length = owner->get_prompt_len();
+    const size_t current_prompt_length = current->get_prompt_len();
+    const size_t owner_content_length = owner_prompt_length + owner_sequence->get_generated_len();
+    const size_t max_length = std::min({limit, owner_content_length, current_prompt_length});
+    if (max_length == 0) {
+        return 0;
+    }
+
+    if (owner->get_sequence_group_type() == SequenceGroupType::TOKENS) {
+        const auto& owner_prompt_ids = owner->get_prompt_ids();
+        const auto& current_prompt_ids = current->get_prompt_ids();
+        const auto& owner_generated_ids = owner_sequence->get_generated_ids();
+        if (owner_prompt_ids.size() != owner_prompt_length || current_prompt_ids.size() != current_prompt_length) {
+            return 0;
+        }
+        for (size_t index = 0; index < max_length; ++index) {
+            const int64_t owner_id = index < owner_prompt_length ? owner_prompt_ids[index]
+                                                                 : owner_generated_ids[index - owner_prompt_length];
+            if (owner_id != current_prompt_ids[index]) {
+                return index;
+            }
+        }
+        return max_length;
+    }
+
+    if (owner->get_sequence_group_type() != SequenceGroupType::EMBEDDINGS) {
+        return 0;
+    }
+    if (owner->get_deepstack_visual_embeds() || current->get_deepstack_visual_embeds() ||
+        owner->get_visual_pos_masks() || current->get_visual_pos_masks()) {
+        return 0;
+    }
+
+    const auto& owner_prompt_embeds = owner->get_input_embeds();
+    const auto& current_prompt_embeds = current->get_input_embeds();
+    const auto& owner_generated_embeds = owner_sequence->get_generated_ids_embeds();
+    const auto& owner_positions = owner_sequence->get_position_ids_list();
+    const auto& current_positions = current_sequence->get_position_ids_list();
+    const auto owner_token_types = owner->get_token_type_ids();
+    const auto current_token_types = current->get_token_type_ids();
+    const auto& owner_per_layer_inputs = owner->get_per_layer_inputs();
+    const auto& current_per_layer_inputs = current->get_per_layer_inputs();
+    const bool has_owner_per_layer_inputs = detail::has_per_layer_inputs(owner_per_layer_inputs);
+    const bool has_current_per_layer_inputs = detail::has_per_layer_inputs(current_per_layer_inputs);
+
+    if (owner_prompt_embeds.size() != owner_prompt_length || current_prompt_embeds.size() != current_prompt_length ||
+        owner_positions.size() < max_length || current_positions.size() < max_length ||
+        has_owner_per_layer_inputs != has_current_per_layer_inputs ||
+        (has_owner_per_layer_inputs &&
+         !detail::per_layer_layouts_match(owner_per_layer_inputs, current_per_layer_inputs))) {
+        return 0;
+    }
+
+    const auto row_matches = [&](size_t index) {
+        const std::vector<float>* owner_embed = nullptr;
+        if (index < owner_prompt_length) {
+            owner_embed = &owner_prompt_embeds[index];
+        } else {
+            const size_t generated_index = index - owner_prompt_length;
+            if (generated_index >= owner_generated_embeds.size()) {
+                return false;
+            }
+            owner_embed = &owner_generated_embeds[generated_index];
+        }
+        if (!detail::embedding_rows_equal(*owner_embed, current_prompt_embeds[index]) ||
+            !detail::tensors_equal(owner_positions[index], current_positions[index])) {
+            return false;
+        }
+
+        const auto owner_type = detail::token_type_at(owner_token_types, index, owner_prompt_length);
+        const auto current_type = detail::token_type_at(current_token_types, index, current_prompt_length);
+        if (!owner_type || !current_type || *owner_type != *current_type || !has_owner_per_layer_inputs) {
+            return owner_type && current_type && *owner_type == *current_type;
+        }
+
+        if (index < owner_prompt_length) {
+            return detail::per_layer_rows_equal(owner_per_layer_inputs, index, current_per_layer_inputs, index);
+        }
+        if (!per_layer_embeddings_callback) {
+            return false;
+        }
+
+        const size_t generated_index = index - owner_prompt_length;
+        const auto& owner_generated_ids = owner_sequence->get_generated_ids();
+        if (generated_index >= owner_generated_ids.size()) {
+            return false;
+        }
+        ov::Tensor input_id(ov::element::i64, {1, 1});
+        input_id.data<int64_t>()[0] = owner_generated_ids[generated_index];
+        const ov::Tensor generated_per_layer_inputs = per_layer_embeddings_callback(input_id);
+        return detail::per_layer_rows_equal(generated_per_layer_inputs, 0, current_per_layer_inputs, index);
+    };
+
+    size_t match_length = 0;
+    while (match_length < max_length && row_matches(match_length)) {
+        ++match_length;
+    }
+    if (match_length < max_length) {
+        return std::min(detail::visual_span_start(owner_token_types, match_length, owner_prompt_length),
+                        detail::visual_span_start(current_token_types, match_length, current_prompt_length));
+    }
+
+    // A prefix may end in the middle of an image span. Check the entire span before accepting it.
+    const size_t last_index = match_length - 1;
+    if (!detail::is_visual_row(owner_token_types, last_index, owner_prompt_length) &&
+        !detail::is_visual_row(current_token_types, last_index, current_prompt_length)) {
+        return match_length;
+    }
+
+    const size_t owner_span_start = detail::visual_span_start(owner_token_types, last_index, owner_prompt_length);
+    const size_t current_span_start = detail::visual_span_start(current_token_types, last_index, current_prompt_length);
+    const size_t span_start = std::min(owner_span_start, current_span_start);
+    const size_t owner_span_end = detail::visual_span_end(owner_token_types, last_index, owner_prompt_length);
+    const size_t current_span_end = detail::visual_span_end(current_token_types, last_index, current_prompt_length);
+    if (owner_span_start != current_span_start || owner_span_end != current_span_end ||
+        owner_span_end > owner_content_length || current_span_end > current_prompt_length ||
+        owner_positions.size() < owner_span_end || current_positions.size() < current_span_end) {
+        return span_start;
+    }
+    for (size_t index = match_length; index < owner_span_end; ++index) {
+        if (!row_matches(index)) {
+            return span_start;
+        }
+    }
+    return match_length;
+}
 
 inline void ensure_num_assistant_tokens_is_set(GenerationConfig& config) {
     OPENVINO_ASSERT(config.assistant_confidence_threshold == 0.f,

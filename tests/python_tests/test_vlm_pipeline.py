@@ -71,7 +71,7 @@ from utils.generation_config import (
 from utils.constants import get_ov_cache_converted_models_dir
 from utils.atomic_download import AtomicDownloadManager
 from utils.custom_op import assert_ir_contains_op_type, get_extension_model, get_extension_lib_path, CustomAdd
-from utils.hugging_face import download_and_convert_model
+from utils.hugging_face import download_and_convert_model, export_with_optimum_cli
 from utils.ov_genai_pipelines import should_skip_npuw_tests
 
 import logging
@@ -303,6 +303,8 @@ NPU_SUPPORTED_MODELS = [id for id in MODEL_IDS if id not in NPU_UNSUPPORTED_MODE
 
 VLM_EAGLE3_MAIN_MODEL_ID = "optimum-intel-internal-testing/tiny-random-qwen3-vl-layer10"
 VLM_EAGLE3_DRAFT_MODEL_ID = "optimum-intel-internal-testing/tiny-random-qwen3-vl-eagle3"
+VLM_DFLASH_MAIN_MODEL_ID = "optimum-intel-internal-testing/tiny-random-gemma4"
+VLM_DFLASH_DRAFT_MODEL_ID = "optimum-intel-internal-testing/tiny-random-gemma4-dflash"
 
 
 def _maybe_skip_unsupported_model_export(model_id: str) -> None:
@@ -369,6 +371,30 @@ def _get_vlm_eagle3_model_paths() -> tuple[Path, Path]:
         model_kwargs={"task": "image-text-to-text"},
     ).models_path
     return Path(_get_ov_model(VLM_EAGLE3_MAIN_MODEL_ID)), draft_model_path
+
+
+@pytest.fixture(scope="module")
+def vlm_dflash_model_paths() -> tuple[Path, Path]:
+    if not any(device.startswith("GPU") for device in openvino.Core().available_devices):
+        pytest.skip("DFlash prefix-cache coverage requires a GPU.")
+    _maybe_skip_unsupported_model_export(VLM_DFLASH_MAIN_MODEL_ID)
+    try:
+        target_path = Path(_get_ov_model(VLM_DFLASH_MAIN_MODEL_ID))
+        draft_path = get_ov_cache_converted_models_dir() / "tiny-random-gemma4-dflash_text-generation-with-past"
+        manager = AtomicDownloadManager(draft_path)
+        manager.execute(
+            lambda temp_path: export_with_optimum_cli(
+                VLM_DFLASH_DRAFT_MODEL_ID,
+                "text-generation-with-past",
+                temp_path,
+                trust_remote_code=True,
+            )
+        )
+    except Exception as error:
+        if error.__class__.__name__ == "AmbiguousGlobalPerLayerAttributeError":
+            pytest.xfail("tiny Gemma 4 export is incompatible with the installed Transformers heterogeneity API")
+        raise
+    return target_path, draft_path
 
 
 def _setup_generation_config(
@@ -3155,6 +3181,91 @@ def test_vlm_eagle3(cat_tensor):
     assert result_without_draft.texts[0].strip() == result_with_draft_tree.texts[0].strip(), (
         "Result should be the same when Eagle3 draft model and tree search are enabled and disabled."
     )
+
+
+def _run_dflash_cb_request(
+    pipeline: ContinuousBatchingPipeline,
+    request_id: int,
+    prompt: str,
+    image: openvino.Tensor,
+    generation_config: GenerationConfig,
+) -> tuple[list[int], int]:
+    handle = pipeline.add_request(request_id, prompt, images=[image], generation_config=generation_config)
+    while pipeline.has_non_finished_requests():
+        pipeline.step()
+    return handle.read_all()[0].generated_ids, handle.get_perf_metrics().get_num_prefix_cache_hit_tokens()
+
+
+def test_vlm_dflash_prefix_caching_add_request_gpu(
+    cat_tensor: openvino.Tensor,
+    vlm_dflash_model_paths: tuple[Path, Path],
+):
+    target_path, draft_path = vlm_dflash_model_paths
+    scheduler_config = SchedulerConfig()
+    scheduler_config.enable_prefix_caching = True
+    scheduler_config.max_num_batched_tokens = 256
+    scheduler_config.num_kv_blocks = 128
+    generation_config = GenerationConfig(
+        do_sample=False,
+        ignore_eos=True,
+        max_new_tokens=3,
+        num_assistant_tokens=2,
+        assistant_confidence_threshold=0,
+    )
+    pipeline = ContinuousBatchingPipeline(
+        target_path,
+        scheduler_config,
+        "GPU",
+        properties={"draft_model": draft_model(draft_path, "GPU")},
+    )
+    prompt = "Describe this image in one short sentence."
+
+    first_ids, first_hit = _run_dflash_cb_request(pipeline, 0, prompt, cat_tensor, generation_config)
+    second_ids, second_hit = _run_dflash_cb_request(pipeline, 1, prompt, cat_tensor, generation_config)
+
+    assert first_ids == second_ids
+    assert first_hit == 0
+    assert second_hit > 0
+
+
+def test_vlm_dflash_prefix_caching_gpu(
+    cat_tensor: openvino.Tensor,
+    vlm_dflash_model_paths: tuple[Path, Path],
+):
+    target_path, draft_path = vlm_dflash_model_paths
+    scheduler_config = SchedulerConfig()
+    scheduler_config.enable_prefix_caching = True
+    scheduler_config.max_num_batched_tokens = 256
+    scheduler_config.num_kv_blocks = 128
+    generation_config = GenerationConfig(
+        do_sample=False,
+        ignore_eos=True,
+        max_new_tokens=3,
+        num_assistant_tokens=2,
+        assistant_confidence_threshold=0,
+    )
+    pipeline = VLMPipeline(
+        target_path,
+        "GPU",
+        scheduler_config=scheduler_config,
+        draft_model=draft_model(draft_path, "GPU"),
+    )
+    prompt = "Describe this image in one short sentence."
+
+    first = pipeline.generate(prompt, images=[cat_tensor], generation_config=generation_config)
+    second = pipeline.generate(prompt, images=[cat_tensor], generation_config=generation_config)
+    changed_image = openvino.Tensor(np.zeros(cat_tensor.get_shape(), dtype=np.uint8))
+    changed = pipeline.generate(prompt, images=[changed_image], generation_config=generation_config)
+
+    first_hit = first.perf_metrics.get_num_prefix_cache_hit_tokens()
+    second_hit = second.perf_metrics.get_num_prefix_cache_hit_tokens()
+    assert first.texts == second.texts
+    assert first_hit == 0
+    assert second_hit > 0
+    assert changed.perf_metrics.get_num_prefix_cache_hit_tokens() < second_hit
+    assert second.extended_perf_metrics.get_num_draft_processed_tokens() > 0
+    assert second.extended_perf_metrics.main_model_metrics.get_num_prefix_cache_hit_tokens() == second_hit
+    assert second.extended_perf_metrics.draft_model_metrics.get_num_prefix_cache_hit_tokens() == second_hit
 
 
 def test_vlm_eagle3_chat_with_videos(

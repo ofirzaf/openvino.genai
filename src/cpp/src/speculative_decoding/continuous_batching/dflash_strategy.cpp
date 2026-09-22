@@ -44,6 +44,14 @@ bool model_has_output(const std::shared_ptr<ov::Model>& model, const std::string
     }) != outputs.end();
 }
 
+SequenceGroup::Ptr find_request_by_id(const std::vector<SequenceGroup::Ptr>& requests, uint64_t request_id) {
+    const auto request_it =
+        std::find_if(requests.begin(), requests.end(), [request_id](const SequenceGroup::Ptr& request) {
+            return request && request->get_request_id() == request_id;
+        });
+    return request_it == requests.end() ? nullptr : *request_it;
+}
+
 void validate_target_has_no_unmanaged_state(const std::shared_ptr<ov::Model>& model) {
     OPENVINO_ASSERT(model, "DFlash target model cannot be null.");
     std::vector<std::string> unmanaged_state_ops;
@@ -71,7 +79,8 @@ public:
           m_embedding_model(std::move(embedding_model)),
           m_request(create_draft_infer_request(model_desc, static_cast<bool>(m_embedding_model))),
           m_sampler(tokenizer),
-          m_mask_token_id(rt_info.mask_token_id) {
+          m_mask_token_id(rt_info.mask_token_id),
+          m_kv_axes_pos(utils::get_kv_axes_pos(model_desc.model)) {
         m_has_beam_idx = has_compiled_input(m_request.get_compiled_model(), "beam_idx");
         if (m_has_beam_idx) {
             m_beam_idx = ov::Tensor(ov::element::i32, {BATCH_SIZE});
@@ -95,6 +104,33 @@ public:
         initialize_sampler_sequence(
             dflash_cb::build_placeholder_prompt_ids(prompt_length, m_tokenizer.get_pad_token_id()),
             config);
+    }
+
+    void reset_state() {
+        m_request.reset_state();
+        m_committed_context_length = 0;
+        if (m_has_beam_idx) {
+            m_request.set_tensor("beam_idx", m_beam_idx);
+        }
+    }
+
+    size_t align_cached_prefix(size_t requested_length) {
+        OPENVINO_ASSERT(requested_length <= m_committed_context_length,
+                        "DFlash cached-prefix alignment cannot advance draft state.");
+        if (requested_length == 0) {
+            reset_state();
+            return 0;
+        }
+        if (requested_length == m_committed_context_length) {
+            return requested_length;
+        }
+
+        utils::CacheState state_to_trim;
+        state_to_trim.num_tokens_to_trim = m_committed_context_length - requested_length;
+        state_to_trim.seq_length_axis = m_kv_axes_pos.seq_len;
+        utils::trim_kv_cache(m_request, state_to_trim, {});
+        m_committed_context_length = requested_length;
+        return requested_length;
     }
 
     void sync_generated_tokens(const std::vector<int64_t>& target_generated_tokens) {
@@ -168,11 +204,6 @@ private:
         m_sampler.clear_request_info(1);
         m_sequence_group = std::make_shared<SequenceGroup>(1, prompt_ids, config);
         m_sequence_group->update_processed_tokens_num(m_prompt_length);
-        m_committed_context_length = 0;
-        m_request.reset_state();
-        if (m_has_beam_idx) {
-            m_request.set_tensor("beam_idx", m_beam_idx);
-        }
         m_raw_perf_metrics.m_inference_durations = {MicroSeconds(0.0f)};
         m_raw_perf_metrics.m_durations.clear();
         m_raw_perf_metrics.m_batch_sizes.clear();
@@ -265,6 +296,7 @@ private:
     size_t m_prompt_length = 0;
     size_t m_committed_context_length = 0;
     int64_t m_mask_token_id = -1;
+    utils::KVAxesPosition m_kv_axes_pos{0, 2};
 };
 
 ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
@@ -274,8 +306,7 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
     : m_rt_info(rt_info) {
     OPENVINO_ASSERT(m_rt_info.dflash_mode, "DFlash continuous batching requires dflash_mode=true.");
     OPENVINO_ASSERT(!m_rt_info.target_layer_ids.empty(), "DFlash target_layer_ids cannot be empty.");
-    OPENVINO_ASSERT(!main_model_desc.scheduler_config.enable_prefix_caching,
-                    "DFlash CB/PA does not support scheduler_config.enable_prefix_caching.");
+    m_prefix_caching_enabled = main_model_desc.scheduler_config.enable_prefix_caching;
 
     auto main_model = main_model_desc.model;
     OPENVINO_ASSERT(main_model && draft_model_desc.model, "DFlash requires both target and draft models.");
@@ -429,6 +460,11 @@ ov::Tensor ContinuousBatchingPipeline::DFlashDecodingImpl::materialize_pending_h
 
 void ContinuousBatchingPipeline::DFlashDecodingImpl::clear_pending_hidden_delta(RequestState& state) {
     state.pending_hidden_deltas.clear();
+    if (m_draft_state_owner) {
+        OPENVINO_ASSERT(m_draft_state_owner->get_sequences().size() == 1,
+                        "DFlash draft state owner must contain one sequence.");
+        m_draft_state_owner->get_sequences().front()->update_hidden_state({});
+    }
 }
 
 void ContinuousBatchingPipeline::DFlashDecodingImpl::validate_hidden_prefix_length(const RequestState& state) const {
@@ -451,11 +487,27 @@ bool ContinuousBatchingPipeline::DFlashDecodingImpl::has_active_request_state() 
 void ContinuousBatchingPipeline::DFlashDecodingImpl::drop_finished_request_states() {
     for (auto state_it = m_request_states.begin(); state_it != m_request_states.end();) {
         if (state_it->second.finished) {
+            clear_pending_hidden_delta(state_it->second);
             state_it = m_request_states.erase(state_it);
         } else {
             ++state_it;
         }
     }
+}
+
+void ContinuousBatchingPipeline::DFlashDecodingImpl::cleanup_requests_unlocked() {
+    for (auto& [_, state] : m_request_states) {
+        clear_pending_hidden_delta(state);
+    }
+    if (m_main_pipeline) {
+        m_main_pipeline->pull_awaiting_requests();
+        m_main_pipeline->finish_request();
+    }
+    m_request_states.clear();
+    if (m_draft) {
+        m_draft->reset_state();
+    }
+    m_draft_state_owner.reset();
 }
 
 GenerationHandle ContinuousBatchingPipeline::DFlashDecodingImpl::add_request(
@@ -503,19 +555,48 @@ GenerationHandle ContinuousBatchingPipeline::DFlashDecodingImpl::add_request(
     } else {
         m_draft->initialize_sequence(input_ids, make_draft_generation_config(sampling_params_copy));
     }
-    m_request_states[request_id] = std::move(state);
+    if (!m_prefix_caching_enabled) {
+        m_draft->reset_state();
+        m_draft_state_owner.reset();
+    }
 
-    // The draft sampler and request state are initialized above. If target
-    // request creation fails, erase the state so a later request is not
-    // rejected as a stale active DFlash request.
+    // Keep the prior draft state intact until target insertion succeeds.
+    const auto main_generation = m_main_pipeline->add_request(request_id,
+                                                               input_ids,
+                                                               sampling_params_copy,
+                                                               prompt_ids,
+                                                               lm_extra_inputs);
     try {
-        return m_main_pipeline->add_request(request_id,
-                                            input_ids,
-                                            sampling_params_copy,
-                                            prompt_ids,
-                                            lm_extra_inputs);
+        const auto target_request = find_request_by_id(m_main_pipeline->get_awaiting_requests(), request_id);
+        OPENVINO_ASSERT(target_request, "DFlash target request is missing from the awaiting queue.");
+
+        const size_t target_restored_prefix = target_request->get_num_processed_tokens();
+        const auto per_layer_embeddings_callback = m_inputs_embedder
+                                                       ? m_inputs_embedder->get_per_layer_embeddings_callback()
+                                                       : dflash_cb::PerLayerEmbeddingsCallback{};
+        const size_t draft_match = m_prefix_caching_enabled
+                                       ? dflash_cb::last_owner_lcp(m_draft_state_owner,
+                                                                   target_request,
+                                                                   m_draft->get_consumed_hidden_states(),
+                                                                   per_layer_embeddings_callback)
+                                       : 0;
+        const size_t requested_common = std::min(target_restored_prefix, draft_match);
+        const size_t actual_common = m_draft->align_cached_prefix(requested_common);
+        OPENVINO_ASSERT(m_main_pipeline->rewind_awaiting_request_prefix(request_id, actual_common),
+                        "DFlash target request is missing while rewinding its restored prefix.");
+
+        target_request->set_num_prefix_cache_hit_tokens(actual_common);
+        m_request_states.emplace(request_id, std::move(state));
+        if (m_prefix_caching_enabled) {
+            m_draft_state_owner = target_request;
+        }
+        m_perf_metrics.num_prefix_cache_hit_tokens = actual_common;
+        m_perf_metrics.main_model_metrics.num_prefix_cache_hit_tokens = actual_common;
+        m_perf_metrics.draft_model_metrics.num_prefix_cache_hit_tokens = actual_common;
+        m_perf_metrics.m_evaluated = false;
+        return main_generation;
     } catch (...) {
-        m_request_states.erase(request_id);
+        cleanup_requests_unlocked();
         throw;
     }
 }
@@ -541,7 +622,15 @@ bool ContinuousBatchingPipeline::DFlashDecodingImpl::has_non_finished_requests()
 
 void ContinuousBatchingPipeline::DFlashDecodingImpl::step() {
     std::lock_guard<std::mutex> lock{m_draft_generations_mutex};
+    try {
+        step_unlocked();
+    } catch (...) {
+        cleanup_requests_unlocked();
+        throw;
+    }
+}
 
+void ContinuousBatchingPipeline::DFlashDecodingImpl::step_unlocked() {
     auto& raw_perf_counters = m_perf_metrics.raw_metrics;
     auto& main_raw_perf_counters = m_perf_metrics.main_model_metrics.raw_metrics;
     const auto step_start = std::chrono::steady_clock::now();
@@ -623,10 +712,23 @@ void ContinuousBatchingPipeline::DFlashDecodingImpl::step() {
 
     auto main_generated_requests = m_main_pipeline->get_generated_requests();
     update_draft_states_from_main(main_generated_requests);
+    bool invalidate_draft_cache = false;
     for (auto& [request_id, state] : m_request_states) {
         if (main_generated_requests.find(request_id) == main_generated_requests.end()) {
             state.finished = true;
+            clear_pending_hidden_delta(state);
+            if (m_draft_state_owner) {
+                OPENVINO_ASSERT(m_draft_state_owner->get_request_id() == request_id,
+                                "DFlash draft state owner must match the active request.");
+                invalidate_draft_cache |=
+                    m_draft_state_owner->handle_cancelled() || m_draft_state_owner->handle_stopped() ||
+                    m_draft_state_owner->get_generation_stream()->get_status() == GenerationStatus::IGNORED;
+            }
         }
+    }
+    if (invalidate_draft_cache) {
+        cleanup_requests_unlocked();
+        return;
     }
 
     for (const auto& [request_id, draft_generated] : draft_generated_by_request) {
@@ -701,11 +803,7 @@ void ContinuousBatchingPipeline::DFlashDecodingImpl::update_draft_states_from_ma
 
 void ContinuousBatchingPipeline::DFlashDecodingImpl::drop_requests() {
     std::lock_guard<std::mutex> lock{m_draft_generations_mutex};
-
-    if (m_main_pipeline) {
-        m_main_pipeline->finish_request();
-    }
-    m_request_states.clear();
+    cleanup_requests_unlocked();
 }
 
 ov::genai::RawPerfMetrics ContinuousBatchingPipeline::DFlashDecodingImpl::collect_draft_raw_metrics() {
@@ -829,7 +927,10 @@ std::vector<EncodedGenerationResult> ContinuousBatchingPipeline::DFlashDecodingI
         m_perf_metrics.raw_metrics.generate_durations.clear();
         m_perf_metrics.raw_metrics.generate_durations.emplace_back(generate_duration_us);
         m_perf_metrics.num_input_tokens = request->get_prompt_len();
-        m_perf_metrics.num_prefix_cache_hit_tokens = request->get_num_prefix_cache_hit_tokens();
+        const size_t aligned_prefix_cache_hit_tokens = request->get_num_prefix_cache_hit_tokens();
+        m_perf_metrics.num_prefix_cache_hit_tokens = aligned_prefix_cache_hit_tokens;
+        m_perf_metrics.main_model_metrics.num_prefix_cache_hit_tokens = aligned_prefix_cache_hit_tokens;
+        m_perf_metrics.draft_model_metrics.num_prefix_cache_hit_tokens = aligned_prefix_cache_hit_tokens;
         m_perf_metrics.evaluate_statistics(start_time);
 
         result.perf_metrics = m_perf_metrics;

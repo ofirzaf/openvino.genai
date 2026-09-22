@@ -1294,6 +1294,62 @@ def _run_cb_requests(pipe: ContinuousBatchingPipeline, prompt: str, configs: lis
     return [handle.read_all()[0].generated_ids for handle in handles]
 
 
+@pytest.fixture(scope="module")
+def dflash_qwen3_paths() -> tuple[Path, Path]:
+    target_path = download_and_convert_model("optimum-intel-internal-testing/tiny-random-qwen3").models_path
+    draft_path = get_ov_cache_converted_models_dir() / "tiny-random-qwen3-dflash_text-generation-with-past"
+    AtomicDownloadManager(draft_path).execute(
+        lambda temp_path: export_with_optimum_cli(
+            "optimum-intel-internal-testing/tiny-random-qwen3-dflash",
+            "text-generation-with-past",
+            temp_path,
+            trust_remote_code=True,
+        )
+    )
+    return target_path, draft_path
+
+
+def _run_dflash_cb_request(
+    pipeline: ContinuousBatchingPipeline,
+    request_id: int,
+    prompt: str,
+    generation_config: GenerationConfig,
+) -> tuple[list[int], int]:
+    handle = pipeline.add_request(request_id, prompt, generation_config=generation_config)
+    while pipeline.has_non_finished_requests():
+        pipeline.step()
+    return handle.read_all()[0].generated_ids, handle.get_perf_metrics().get_num_prefix_cache_hit_tokens()
+
+
+def test_dflash_cb_prefix_caching_cpu(dflash_qwen3_paths: tuple[Path, Path]):
+    target_path, draft_path = dflash_qwen3_paths
+    scheduler_config = SchedulerConfig()
+    scheduler_config.enable_prefix_caching = True
+    scheduler_config.max_num_batched_tokens = 256
+    scheduler_config.num_kv_blocks = 128
+    generation_config = GenerationConfig(
+        do_sample=False,
+        ignore_eos=True,
+        max_new_tokens=3,
+        num_assistant_tokens=2,
+        assistant_confidence_threshold=0,
+    )
+    pipeline = ContinuousBatchingPipeline(
+        target_path,
+        scheduler_config,
+        "CPU",
+        properties={"draft_model": draft_model(draft_path, "CPU")},
+    )
+    prompt = "DFlash prefix caching must retain the same draft state. " * 32
+
+    first_ids, first_hit = _run_dflash_cb_request(pipeline, 0, prompt, generation_config)
+    second_ids, second_hit = _run_dflash_cb_request(pipeline, 1, prompt, generation_config)
+
+    assert first_ids == second_ids
+    assert first_hit == 0
+    assert second_hit > 0
+
+
 def test_cb_same_seed_produces_identical_output(model_facebook_opt_125m: OVConvertedModelSchema):
     """Two requests with the same rng_seed must produce identical token sequences."""
     pipe = ContinuousBatchingPipeline(model_facebook_opt_125m.models_path, SchedulerConfig(), "CPU")

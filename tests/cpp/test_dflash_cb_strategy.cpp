@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 #include "openvino/op/add.hpp"
@@ -26,6 +28,7 @@
 #include "openvino/op/unsqueeze.hpp"
 #include "openvino/op/util/variable.hpp"
 #include "openvino/pass/sdpa_to_paged_attention.hpp"
+#include "openvino/runtime/core.hpp"
 #include "speculative_decoding/continuous_batching/dflash_strategy_utils.hpp"
 #include "speculative_decoding/dflash_model_transforms.hpp"
 #include "utils.hpp"
@@ -128,6 +131,38 @@ std::shared_ptr<ov::Model> make_dflash_draft_hidden_states_model(const ov::Parti
     return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{hidden_states});
 }
 
+std::shared_ptr<ov::Model> make_kv_state_contract_model() {
+    auto kv_delta =
+        std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape{1, 1, ov::Dimension::dynamic(), 1});
+    kv_delta->set_friendly_name("kv_delta");
+    kv_delta->output(0).set_names({"kv_delta"});
+
+    auto variable = std::make_shared<ov::op::util::Variable>(
+        ov::op::util::VariableInfo{ov::PartialShape{1, 1, ov::Dimension::dynamic(), 1},
+                                   ov::element::f32,
+                                   "dflash_kv_state"});
+    auto initial = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{1, 1, 0, 1}, std::vector<float>{});
+    auto read = std::make_shared<ov::op::v6::ReadValue>(initial, variable);
+    auto concat = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{read, kv_delta}, 2);
+    auto assign = std::make_shared<ov::op::v6::Assign>(concat, variable);
+    auto result = std::make_shared<ov::op::v0::Result>(concat);
+    return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::SinkVector{assign}, ov::ParameterVector{kv_delta});
+}
+
+void infer_kv_delta(ov::InferRequest& request, size_t length) {
+    ov::Tensor delta(ov::element::f32, ov::Shape{1, 1, length, 1});
+    std::iota(delta.data<float>(), delta.data<float>() + delta.get_size(), 0.0f);
+    request.set_tensor("kv_delta", delta);
+    request.infer();
+}
+
+void expect_kv_state_length(ov::InferRequest& request, size_t expected_length) {
+    const auto states = request.query_state();
+    ASSERT_EQ(states.size(), 1);
+    const auto shape = states.front().get_state().get_shape();
+    ASSERT_EQ(shape, ov::Shape({1, 1, expected_length, 1}));
+}
+
 ov::Tensor make_token_major_hidden_delta(size_t seq_len, size_t hidden_size, float start = 0.0f) {
     ov::Tensor tensor(ov::element::f32, ov::Shape{seq_len, 1, hidden_size});
     std::iota(tensor.data<float>(), tensor.data<float>() + tensor.get_size(), start);
@@ -142,6 +177,64 @@ std::vector<float> tensor_values(const ov::Tensor& tensor) {
 std::vector<int64_t> int64_tensor_values(const ov::Tensor& tensor) {
     const auto* data = tensor.data<const int64_t>();
     return std::vector<int64_t>(data, data + tensor.get_size());
+}
+
+ov::Tensor make_embeddings(size_t rows, size_t hidden_size, float start = 0.0f) {
+    ov::Tensor tensor(ov::element::f32, ov::Shape{1, rows, hidden_size});
+    std::iota(tensor.data<float>(), tensor.data<float>() + tensor.get_size(), start);
+    return tensor;
+}
+
+ov::Tensor make_position_ids(const std::vector<int64_t>& values) {
+    ov::Tensor tensor(ov::element::i64, ov::Shape{1, values.size()});
+    std::copy(values.begin(), values.end(), tensor.data<int64_t>());
+    return tensor;
+}
+
+ov::Tensor make_per_layer_inputs(const std::vector<float>& values) {
+    ov::Tensor tensor(ov::element::f32, ov::Shape{1, values.size(), 1, 1});
+    std::copy(values.begin(), values.end(), tensor.data<float>());
+    return tensor;
+}
+
+ov::genai::SequenceGroup::Ptr make_embedding_group(uint64_t request_id,
+                                                   const ov::Tensor& embeddings,
+                                                   const std::vector<int64_t>& position_ids,
+                                                   const std::vector<int64_t>& token_type_ids = {},
+                                                   const std::vector<float>& per_layer_values = {},
+                                                   bool with_deepstack = false) {
+    std::unordered_map<std::string, ov::Tensor> extra_inputs;
+    if (!token_type_ids.empty()) {
+        extra_inputs.emplace("token_type_ids", make_position_ids(token_type_ids));
+    }
+    if (!per_layer_values.empty()) {
+        extra_inputs.emplace("per_layer_inputs", make_per_layer_inputs(per_layer_values));
+    }
+    if (with_deepstack) {
+        extra_inputs.emplace("deepstack_visual_embeds", ov::Tensor(ov::element::f32, ov::Shape{1, 1, 1}));
+    }
+    std::optional<std::unordered_map<std::string, ov::Tensor>> optional_extra_inputs;
+    if (!extra_inputs.empty()) {
+        optional_extra_inputs = std::move(extra_inputs);
+    }
+
+    return std::make_shared<ov::genai::SequenceGroup>(request_id,
+                                                      embeddings,
+                                                      ov::genai::GenerationConfig{},
+                                                      optional_extra_inputs,
+                                                      std::make_optional(make_position_ids(position_ids)));
+}
+
+void append_generated_embedding(const ov::genai::SequenceGroup::Ptr& group,
+                                int64_t token_id,
+                                const std::vector<float>& embedding,
+                                int64_t position_id) {
+    const auto sequence = group->get_sequences().front();
+    sequence->append_token(token_id, 0.0f);
+    ov::Tensor generated_embedding(ov::element::f32, ov::Shape{1, 1, embedding.size()});
+    std::copy(embedding.begin(), embedding.end(), generated_embedding.data<float>());
+    sequence->append_generated_ids_embeds(generated_embedding);
+    sequence->append_position_ids(make_position_ids({position_id}));
 }
 
 std::shared_ptr<ov::op::v1::Add> find_dflash_draft_hidden_states_consumer(const std::shared_ptr<ov::Model>& model) {
@@ -358,6 +451,73 @@ TEST(DFlashCBHiddenState, TruncatesRejectedTail) {
     auto empty = ov::genai::dflash_cb::truncate_normalized_hidden_state_from_end(hidden_delta, 4);
     ASSERT_EQ(empty.get_shape(), ov::Shape({0, 1, 2}));
     ASSERT_EQ(empty.get_size(), 0);
+}
+
+TEST(DFlashCBDraftStateContract, TrimsAndResetsKVState) {
+    ov::Core core;
+    auto request = core.compile_model(make_kv_state_contract_model(), "CPU").create_infer_request();
+
+    infer_kv_delta(request, 3);
+    expect_kv_state_length(request, 3);
+
+    ov::genai::utils::CacheState state_to_trim;
+    state_to_trim.num_tokens_to_trim = 1;
+    state_to_trim.seq_length_axis = 2;
+    ov::genai::utils::trim_kv_cache(request, state_to_trim, {});
+    expect_kv_state_length(request, 2);
+
+    infer_kv_delta(request, 1);
+    expect_kv_state_length(request, 3);
+
+    request.reset_state();
+    expect_kv_state_length(request, 0);
+}
+
+TEST(DFlashCBPrefixIdentity, MatchesTokenPromptAndGeneratedPrefix) {
+    auto owner =
+        std::make_shared<ov::genai::SequenceGroup>(1, ov::genai::TokenIds{10, 20}, ov::genai::GenerationConfig{});
+    owner->get_sequences().front()->append_token(30, 0.0f);
+    owner->get_sequences().front()->append_token(40, 0.0f);
+    auto current = std::make_shared<ov::genai::SequenceGroup>(2,
+                                                              ov::genai::TokenIds{10, 20, 30, 99},
+                                                              ov::genai::GenerationConfig{});
+
+    EXPECT_EQ(ov::genai::dflash_cb::last_owner_lcp(owner, current, 4), 3);
+}
+
+TEST(DFlashCBPrefixIdentity, MatchesGeneratedEmbeddingPerLayerInput) {
+    auto owner = make_embedding_group(1, make_embeddings(2, 2), {0, 1}, {0, 0}, {10.0f, 11.0f});
+    append_generated_embedding(owner, 7, {4.0f, 5.0f}, 2);
+    auto current = make_embedding_group(2, make_embeddings(3, 2), {0, 1, 2}, {0, 0, 0}, {10.0f, 11.0f, 42.0f});
+    const ov::genai::dflash_cb::PerLayerEmbeddingsCallback callback = [](const ov::Tensor& input_ids) {
+        EXPECT_EQ(int64_tensor_values(input_ids), (std::vector<int64_t>{7}));
+        return make_per_layer_inputs({42.0f});
+    };
+
+    EXPECT_EQ(ov::genai::dflash_cb::last_owner_lcp(owner, current, 3, callback), 3);
+    EXPECT_EQ(ov::genai::dflash_cb::last_owner_lcp(owner, current, 3), 2);
+}
+
+TEST(DFlashCBPrefixIdentity, StopsOnEmbeddingPositionAndAuxiliaryMismatches) {
+    auto owner = make_embedding_group(1, make_embeddings(3, 2), {0, 1, 2}, {0, 0, 0}, {1.0f, 2.0f, 3.0f});
+    auto position_mismatch = make_embedding_group(2, make_embeddings(3, 2), {0, 8, 2}, {0, 0, 0}, {1.0f, 2.0f, 3.0f});
+    auto per_layer_mismatch = make_embedding_group(3, make_embeddings(3, 2), {0, 1, 2}, {0, 0, 0}, {1.0f, 9.0f, 3.0f});
+    auto deepstack_input =
+        make_embedding_group(4, make_embeddings(3, 2), {0, 1, 2}, {0, 0, 0}, {1.0f, 2.0f, 3.0f}, true);
+
+    EXPECT_EQ(ov::genai::dflash_cb::last_owner_lcp(owner, position_mismatch, 3), 1);
+    EXPECT_EQ(ov::genai::dflash_cb::last_owner_lcp(owner, per_layer_mismatch, 3), 1);
+    EXPECT_EQ(ov::genai::dflash_cb::last_owner_lcp(owner, deepstack_input, 3), 0);
+}
+
+TEST(DFlashCBPrefixIdentity, BacksUpAndVerifiesImageSpans) {
+    auto owner = make_embedding_group(1, make_embeddings(4, 2), {0, 1, 2, 3}, {0, 1, 1, 0});
+    auto changed_embeddings = make_embeddings(4, 2);
+    changed_embeddings.data<float>()[4] = -1.0f;
+    auto changed = make_embedding_group(2, changed_embeddings, {0, 1, 2, 3}, {0, 1, 1, 0});
+
+    EXPECT_EQ(ov::genai::dflash_cb::last_owner_lcp(owner, changed, 4), 1);
+    EXPECT_EQ(ov::genai::dflash_cb::last_owner_lcp(owner, changed, 2), 1);
 }
 
 TEST(DFlashCBDraftInputs, BuildsSeedMaskBlock) {

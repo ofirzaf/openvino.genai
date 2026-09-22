@@ -56,17 +56,21 @@ private:
     static void append_pending_hidden_delta(RequestState& state, const ov::Tensor& hidden_delta, bool copy_data);
     static bool has_pending_hidden_delta(const RequestState& state);
     static ov::Tensor materialize_pending_hidden_delta(const RequestState& state);
-    static void clear_pending_hidden_delta(RequestState& state);
+    void clear_pending_hidden_delta(RequestState& state);
     void validate_hidden_prefix_length(const RequestState& state) const;
     bool has_active_request_state() const;
     void drop_finished_request_states();
     void update_draft_states_from_main(const GeneratedRequests& main_generated_requests);
+    void step_unlocked();
+    void cleanup_requests_unlocked();
     void drop_requests();
     ov::genai::RawPerfMetrics collect_draft_raw_metrics();
 
     std::shared_ptr<DFlashCBDraftRunner> m_draft;
     ov::genai::utils::dflash::DFlashRTInfo m_rt_info;
     std::map<uint64_t, RequestState> m_request_states;
+    SequenceGroup::Ptr m_draft_state_owner;
+    bool m_prefix_caching_enabled = false;
 };
 
 }  // namespace ov::genai
