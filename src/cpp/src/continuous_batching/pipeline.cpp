@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <mutex>
 #include <memory>
-#include <optional>
 #include <openvino/runtime/properties.hpp>
 
 #include "openvino/genai/continuous_batching_pipeline.hpp"
@@ -46,70 +45,6 @@ float get_load_time(std::chrono::steady_clock::time_point start_time) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(stop_time - start_time).count();
 }
 
-std::optional<VLMConfig> get_muse_glimmer_dflash_config(
-    const std::filesystem::path& config_dir_path,
-    const utils::dflash::DFlashRTInfo& dflash_rt_info) {
-    if (!dflash_rt_info.dflash_mode) {
-        return std::nullopt;
-    }
-    auto vlm_config = utils::from_config_json_if_exists<VLMConfig>(config_dir_path, "config.json");
-    if (vlm_config.model_type != VLMModelType::MUSE_GLIMMER) {
-        return std::nullopt;
-    }
-    return vlm_config;
-}
-
-std::shared_ptr<InputsEmbedder> create_inputs_embedder_from_path(
-    const std::shared_ptr<ov::Model>& language_model,
-    const std::filesystem::path& model_dir,
-    const Tokenizer& tokenizer,
-    const std::string& device,
-    const ov::AnyMap& properties,
-    const utils::dflash::DFlashRTInfo& dflash_rt_info) {
-    const auto vlm_config = get_muse_glimmer_dflash_config(model_dir, dflash_rt_info);
-    if (!vlm_config) {
-        return std::make_shared<InputsEmbedder>(model_dir, tokenizer, device, properties);
-    }
-
-    const auto text_embeddings_path = model_dir / "openvino_text_embeddings_model.xml";
-    const auto vision_embeddings_path = model_dir / "openvino_vision_embeddings_model.xml";
-    OPENVINO_ASSERT(std::filesystem::exists(text_embeddings_path) && std::filesystem::exists(vision_embeddings_path),
-                    "Muse Glimmer DFlash requires both text and vision embedding component models.");
-
-    auto& core = utils::singleton_core();
-    const auto text_properties = utils::get_model_properties(properties, "text_embeddings", device);
-    auto text_embeddings_model = core.read_model(text_embeddings_path, {}, text_properties);
-    auto vision_embeddings_model = core.read_model(vision_embeddings_path);
-    utils::dflash::hoist_muse_glimmer_embedding_norms(
-        language_model, text_embeddings_model, vision_embeddings_model, vlm_config->scale_emb);
-    return std::make_shared<InputsEmbedder>(
-        model_dir, tokenizer, text_embeddings_model, vision_embeddings_model, device, properties);
-}
-
-std::shared_ptr<InputsEmbedder> create_inputs_embedder_from_models_map(
-    const std::shared_ptr<ov::Model>& language_model,
-    const ModelsMap& models_map,
-    const std::filesystem::path& config_dir_path,
-    const Tokenizer& tokenizer,
-    const std::string& device,
-    const ov::AnyMap& properties,
-    const utils::dflash::DFlashRTInfo& dflash_rt_info) {
-    const auto vlm_config = get_muse_glimmer_dflash_config(config_dir_path, dflash_rt_info);
-    if (!vlm_config) {
-        return std::make_shared<InputsEmbedder>(models_map, tokenizer, config_dir_path, device, properties);
-    }
-
-    const auto& [text_model, text_weights] = utils::get_model_weights_pair(models_map, "text_embeddings");
-    const auto& [vision_model, vision_weights] = utils::get_model_weights_pair(models_map, "vision_embeddings");
-    auto& core = utils::singleton_core();
-    auto text_embeddings_model = core.read_model(text_model, text_weights);
-    auto vision_embeddings_model = core.read_model(vision_model, vision_weights);
-    utils::dflash::hoist_muse_glimmer_embedding_norms(
-        language_model, text_embeddings_model, vision_embeddings_model, vlm_config->scale_emb);
-    return std::make_shared<InputsEmbedder>(
-        config_dir_path, tokenizer, text_embeddings_model, vision_embeddings_model, device, properties);
-}
-
 } // namespace
 
 ContinuousBatchingPipeline::ContinuousBatchingPipeline( const std::filesystem::path& models_path,
@@ -138,8 +73,7 @@ ContinuousBatchingPipeline::ContinuousBatchingPipeline( const std::filesystem::p
     std::shared_ptr<InputsEmbedder> embedder;
     if (std::filesystem::exists(models_path / "openvino_text_embeddings_model.xml")) {
         auto non_adapter_properties = extract_adapters_from_properties(properties_without_draft_model);
-        embedder = create_inputs_embedder_from_path(
-            model, models_path, tokenizer, device, non_adapter_properties.fork(), dflash_rt_info);
+        embedder = std::make_shared<InputsEmbedder>(models_path, tokenizer, device, non_adapter_properties.fork());
     }
 
     utils::print_scheduler_config_info(scheduler_config);
@@ -202,8 +136,7 @@ ContinuousBatchingPipeline::ContinuousBatchingPipeline(const std::shared_ptr<ov:
     std::shared_ptr<InputsEmbedder> embedder;
     if (std::filesystem::exists(models_path / "openvino_text_embeddings_model.xml")) {
         auto non_adapter_properties = extract_adapters_from_properties(properties_without_draft_model);
-        embedder = create_inputs_embedder_from_path(
-            model, models_path, tokenizer, device, non_adapter_properties.fork(), dflash_rt_info);
+        embedder = std::make_shared<InputsEmbedder>(models_path, tokenizer, device, non_adapter_properties.fork());
     }
 
     utils::print_scheduler_config_info(scheduler_config);
@@ -264,8 +197,7 @@ ContinuousBatchingPipeline::ContinuousBatchingPipeline(
     auto generation_config = utils::from_config_json_if_exists(models_path);
     std::shared_ptr<InputsEmbedder> embedder;
     if (std::filesystem::exists(models_path / "openvino_text_embeddings_model.xml")) {
-        embedder = create_inputs_embedder_from_path(
-            model, models_path, tokenizer, device, properties_without_draft_model_without_gguf, dflash_rt_info);
+        embedder = std::make_shared<InputsEmbedder>(models_path, tokenizer, device, properties_without_draft_model_without_gguf);
     }
 
     utils::print_scheduler_config_info(scheduler_config);
@@ -369,8 +301,7 @@ ContinuousBatchingPipeline::ContinuousBatchingPipeline(
         std::string weights_path = rt_info.at("__weights_path").as<std::string>();
         directory = std::filesystem::path(weights_path).parent_path();
         if (std::filesystem::exists(directory / "openvino_text_embeddings_model.xml")) {
-            embedder = create_inputs_embedder_from_path(
-                model, directory, tokenizer, device, properties_without_draft_model, dflash_rt_info);
+            embedder = std::make_shared<InputsEmbedder>(directory, tokenizer, device, properties_without_draft_model);
         }
     }
 
@@ -431,15 +362,14 @@ ContinuousBatchingPipeline::ContinuousBatchingPipeline(
     std::shared_ptr<InputsEmbedder> embedder = nullptr;
     if (embedder_config_dir_path.has_value()) {
         auto path = *embedder_config_dir_path;
-        embedder = create_inputs_embedder_from_models_map(
-            model, models_map, path, tokenizer, device, properties_without_draft_model, dflash_rt_info);
+        embedder =
+            std::make_shared<InputsEmbedder>(models_map, tokenizer, path, device, properties_without_draft_model);
     }
     else if (rt_info.find("__weights_path") != rt_info.end()) {
         std::string weights_path = rt_info.at("__weights_path").as<std::string>();
         directory = std::filesystem::path(weights_path).parent_path();
         if (std::filesystem::exists(directory / "openvino_text_embeddings_model.xml")) {
-            embedder = create_inputs_embedder_from_path(
-                model, directory, tokenizer, device, properties_without_draft_model, dflash_rt_info);
+            embedder = std::make_shared<InputsEmbedder>(directory, tokenizer, device, properties_without_draft_model);
         }
     }
 
@@ -495,15 +425,13 @@ ContinuousBatchingPipeline::ContinuousBatchingPipeline(
     std::shared_ptr<InputsEmbedder> embedder = nullptr;
     if (embedder_config_dir_path.has_value()) {
         auto path = *embedder_config_dir_path;
-        embedder = create_inputs_embedder_from_models_map(
-            model, models_map, path, tokenizer, device, properties, dflash_rt_info);
+        embedder = std::make_shared<InputsEmbedder>(models_map, tokenizer, path, device, properties);
     }
     else if (rt_info.find("__weights_path") != rt_info.end()) {
         std::string weights_path = rt_info.at("__weights_path").as<std::string>();
         directory = std::filesystem::path(weights_path).parent_path();
         if (std::filesystem::exists(directory / "openvino_text_embeddings_model.xml")) {
-            embedder = create_inputs_embedder_from_path(
-                model, directory, tokenizer, device, properties_without_draft_model, dflash_rt_info);
+            embedder = std::make_shared<InputsEmbedder>(directory, tokenizer, device, properties_without_draft_model);
         }
     }
 
