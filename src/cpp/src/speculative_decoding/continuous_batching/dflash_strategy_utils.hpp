@@ -7,6 +7,7 @@
 #include <cstring>
 #include <limits>
 #include <numeric>
+#include <string>
 #include <vector>
 
 #include <openvino/core/except.hpp>
@@ -215,6 +216,81 @@ inline ov::Tensor build_draft_attention_mask(size_t committed_context_length,
     ov::Tensor attention_mask(ov::element::i64, {1, attention_mask_length});
     std::fill_n(attention_mask.data<int64_t>(), attention_mask.get_size(), 1);
     return attention_mask;
+}
+
+inline constexpr const char* LEGACY_DRAFT_BACKEND_ENV = "OPENVINO_GENAI_LEGACY_DFLASH";
+
+enum class DraftBackend { SDPA, PA };
+
+// Selects the single-request draft runner until the full CB draft pipeline exists.
+inline DraftBackend parse_legacy_draft_backend(const char* value) {
+    OPENVINO_ASSERT(value != nullptr,
+                    "DFlash full CB is not implemented yet; set ", LEGACY_DRAFT_BACKEND_ENV, "=SDPA or PA.");
+    const std::string backend(value);
+    if (backend == "SDPA") {
+        return DraftBackend::SDPA;
+    }
+    if (backend == "PA") {
+        return DraftBackend::PA;
+    }
+    OPENVINO_THROW("Unsupported ", LEGACY_DRAFT_BACKEND_ENV, " value '", backend, "'; expected SDPA or PA.");
+}
+
+inline size_t draft_block_length(size_t candidate_count, size_t candidate_position_offset) {
+    OPENVINO_ASSERT(candidate_count > 0, "DFlash candidate_count must be greater than 0.");
+    return candidate_count + candidate_position_offset;
+}
+
+// Per-row drafts (exported with a token_type_ids input) take every per-token input over the new rows
+// [context delta ; block]: input_ids is read in the block rows and hidden_states in the context rows.
+inline ov::Tensor build_draft_row_input_ids(int64_t seed_token,
+                                            int64_t mask_token_id,
+                                            size_t hidden_delta_length,
+                                            size_t candidate_count,
+                                            size_t candidate_position_offset) {
+    auto block_ids = build_draft_input_ids(seed_token, mask_token_id, candidate_count, candidate_position_offset);
+    ov::Tensor input_ids(ov::element::i64, {1, hidden_delta_length + block_ids.get_size()});
+    auto* data = input_ids.data<int64_t>();
+    // context rows read the target hidden states; their embedding is never used
+    std::fill_n(data, hidden_delta_length, mask_token_id);
+    std::copy_n(block_ids.data<const int64_t>(), block_ids.get_size(), data + hidden_delta_length);
+    return input_ids;
+}
+
+inline ov::Tensor build_draft_row_hidden_states(const ov::Tensor& hidden_delta,
+                                                size_t candidate_count,
+                                                size_t candidate_position_offset) {
+    const auto shape = hidden_delta.get_shape();
+    OPENVINO_ASSERT(shape.size() == 3, "DFlash hidden delta must have rank 3.");
+    const size_t num_rows = shape[0] + draft_block_length(candidate_count, candidate_position_offset);
+    ov::Tensor hidden_states(hidden_delta.get_element_type(), {num_rows, shape[1], shape[2]});
+    auto* data = static_cast<uint8_t*>(hidden_states.data());
+    std::memcpy(data, hidden_delta.data(), hidden_delta.get_byte_size());
+    // block rows read their own embeddings; their hidden states are never used
+    std::memset(data + hidden_delta.get_byte_size(), 0, hidden_states.get_byte_size() - hidden_delta.get_byte_size());
+    return hidden_states;
+}
+
+inline ov::Tensor build_draft_token_type_ids(size_t hidden_delta_length,
+                                             size_t candidate_count,
+                                             size_t candidate_position_offset) {
+    const size_t block_length = draft_block_length(candidate_count, candidate_position_offset);
+    ov::Tensor token_type_ids(ov::element::i64, {1, hidden_delta_length + block_length});
+    auto* data = token_type_ids.data<int64_t>();
+    std::fill_n(data, hidden_delta_length, 0);
+    std::fill_n(data + hidden_delta_length, block_length, 1);
+    return token_type_ids;
+}
+
+// Rows of [context delta ; block] whose hidden states become draft candidates.
+inline ov::Tensor build_draft_candidate_row_indices(size_t hidden_delta_length,
+                                                    size_t candidate_count,
+                                                    size_t candidate_position_offset) {
+    OPENVINO_ASSERT(candidate_count > 0, "DFlash candidate_count must be greater than 0.");
+    ov::Tensor indices(ov::element::i64, {candidate_count});
+    auto* data = indices.data<int64_t>();
+    std::iota(data, data + candidate_count, static_cast<int64_t>(hidden_delta_length + candidate_position_offset));
+    return indices;
 }
 
 inline size_t draft_candidate_count(size_t num_assistant_tokens, size_t generated_len, size_t max_new_tokens) {

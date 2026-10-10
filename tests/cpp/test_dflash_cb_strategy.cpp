@@ -412,6 +412,65 @@ TEST(DFlashCBDraftInputs, BuildsAttentionMaskForFullDraftContext) {
               (std::vector<int64_t>{1, 1, 1, 1, 1, 1, 1, 1, 1, 1}));
 }
 
+TEST(DFlashCBDraftBackend, ParsesSdpaAndPa) {
+    using ov::genai::dflash_cb::DraftBackend;
+    ASSERT_EQ(ov::genai::dflash_cb::parse_legacy_draft_backend("SDPA"), DraftBackend::SDPA);
+    ASSERT_EQ(ov::genai::dflash_cb::parse_legacy_draft_backend("PA"), DraftBackend::PA);
+}
+
+TEST(DFlashCBDraftBackend, RejectsUnsetAndUnknownValues) {
+    ASSERT_THROW(ov::genai::dflash_cb::parse_legacy_draft_backend(nullptr), ov::Exception);
+    for (const char* value : {"", "pa", "sdpa", "SPDA", "CB"}) {
+        ASSERT_THROW(ov::genai::dflash_cb::parse_legacy_draft_backend(value), ov::Exception) << value;
+    }
+}
+
+TEST(DFlashCBDraftRowInputs, BuildsRowInputIds) {
+    auto input_ids = ov::genai::dflash_cb::build_draft_row_input_ids(42, 99, 2, 3, /*candidate_position_offset=*/1);
+    ASSERT_EQ(input_ids.get_shape(), ov::Shape({1, 6}));
+    ASSERT_EQ(int64_tensor_values(input_ids), (std::vector<int64_t>{99, 99, 42, 99, 99, 99}));
+
+    auto input_ids_deepspec =
+        ov::genai::dflash_cb::build_draft_row_input_ids(42, 99, 2, 3, /*candidate_position_offset=*/0);
+    ASSERT_EQ(input_ids_deepspec.get_shape(), ov::Shape({1, 5}));
+    ASSERT_EQ(int64_tensor_values(input_ids_deepspec), (std::vector<int64_t>{99, 99, 42, 99, 99}));
+}
+
+TEST(DFlashCBDraftRowInputs, BuildsRowHiddenStatesWithZeroBlockRows) {
+    ov::Tensor hidden_delta(ov::element::f32, {2, 1, 2});
+    std::iota(hidden_delta.data<float>(), hidden_delta.data<float>() + hidden_delta.get_size(), 1.0f);
+
+    for (size_t offset : {size_t{0}, size_t{1}}) {
+        auto hidden_states = ov::genai::dflash_cb::build_draft_row_hidden_states(hidden_delta, 3, offset);
+        ASSERT_EQ(hidden_states.get_shape(), ov::Shape({2 + 3 + offset, 1, 2}));
+        const float* data = hidden_states.data<const float>();
+        std::vector<float> expected(hidden_states.get_size(), 0.0f);
+        std::iota(expected.begin(), expected.begin() + hidden_delta.get_size(), 1.0f);
+        ASSERT_EQ(std::vector<float>(data, data + hidden_states.get_size()), expected) << "offset=" << offset;
+    }
+}
+
+TEST(DFlashCBDraftRowInputs, BuildsTokenTypeIds) {
+    auto token_type_ids = ov::genai::dflash_cb::build_draft_token_type_ids(2, 3, /*candidate_position_offset=*/1);
+    ASSERT_EQ(token_type_ids.get_shape(), ov::Shape({1, 6}));
+    ASSERT_EQ(int64_tensor_values(token_type_ids), (std::vector<int64_t>{0, 0, 1, 1, 1, 1}));
+
+    auto token_type_ids_deepspec =
+        ov::genai::dflash_cb::build_draft_token_type_ids(2, 3, /*candidate_position_offset=*/0);
+    ASSERT_EQ(token_type_ids_deepspec.get_shape(), ov::Shape({1, 5}));
+    ASSERT_EQ(int64_tensor_values(token_type_ids_deepspec), (std::vector<int64_t>{0, 0, 1, 1, 1}));
+}
+
+TEST(DFlashCBDraftRowInputs, SelectsCandidateRowsAfterContextAndOffset) {
+    auto indices = ov::genai::dflash_cb::build_draft_candidate_row_indices(4, 3, /*candidate_position_offset=*/1);
+    ASSERT_EQ(indices.get_shape(), ov::Shape({3}));
+    ASSERT_EQ(int64_tensor_values(indices), (std::vector<int64_t>{5, 6, 7}));
+
+    auto indices_deepspec =
+        ov::genai::dflash_cb::build_draft_candidate_row_indices(4, 3, /*candidate_position_offset=*/0);
+    ASSERT_EQ(int64_tensor_values(indices_deepspec), (std::vector<int64_t>{4, 5, 6}));
+}
+
 TEST(DFlashCBVlmPromptIds, BuildsPlaceholderPromptIds) {
     ASSERT_EQ(ov::genai::dflash_cb::build_placeholder_prompt_ids(3, 42), (std::vector<int64_t>{42, 42, 42}));
 }
