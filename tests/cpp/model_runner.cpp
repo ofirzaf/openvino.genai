@@ -349,6 +349,42 @@ TEST(TestModelRunnerDFlashDraft, batched_windows_use_their_own_rows) {
     EXPECT_EQ(second->get_output_seq_len(), 3);
 }
 
+// The runner keeps one hidden_states tensor for all its steps, so a step must not read the rows an earlier step left.
+TEST(TestModelRunnerDFlashDraft, hidden_states_hold_only_the_rows_of_their_step) {
+    ov::Core core;
+    ov::InferRequest request = core.compile_model(create_dummy_dflash_draft_model(), "CPU").create_infer_request();
+    ModelRunner runner(request, /*block_size=*/4, /*num_decoder_layers=*/1);
+    runner.enable_dflash_draft(/*candidate_position_offset=*/1);
+
+    uint64_t request_id = 0;
+    // Forwards one window of `target_rows` target rows and, unless it is a prefill chunk, the 4-row block.
+    const auto forward_window = [&](size_t target_rows, bool with_block) {
+        const std::vector<int64_t> prompt_tokens(target_rows, 0);
+        const size_t window_rows = target_rows + (with_block ? 4 : 0);
+        auto group = make_dflash_window_group(prompt_tokens, window_rows, request_id);
+        runner.set_initial_hidden_state(request_id, make_dflash_hidden_rows(target_rows));
+        ++request_id;
+        const auto seq_id = group->get_running_sequences()[0]->get_id();
+        std::ignore = runner.forward({group},
+                                     make_output_for_single_sequence(seq_id, window_rows, BlocksPerLayer{std::make_shared<CacheBlock>(0)}));
+
+        const ov::Tensor hidden_states = runner.get_infer_request().get_tensor("hidden_states");
+        EXPECT_EQ(hidden_states.get_shape(), (ov::Shape{window_rows, 1, DFLASH_HIDDEN_SIZE}));
+        std::vector<float> expected(window_rows * DFLASH_HIDDEN_SIZE, 0.0f);
+        std::iota(expected.begin(), expected.begin() + target_rows * DFLASH_HIDDEN_SIZE, 1.0f);
+        EXPECT_EQ(tensor_values<float>(hidden_states), expected);
+    };
+
+    forward_window(8, /*with_block=*/true);
+    // a smaller step: its block rows held target rows of the step before
+    forward_window(2, /*with_block=*/true);
+    // a prefill chunk: its target rows held block rows of the step before
+    forward_window(4, /*with_block=*/false);
+    // a larger step than any before: the tensor grows
+    forward_window(12, /*with_block=*/true);
+    forward_window(3, /*with_block=*/true);
+}
+
 namespace {
 
 // A target that exports the id of every scheduled token as its hidden row.

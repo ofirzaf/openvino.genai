@@ -4,6 +4,7 @@
 #pragma once
 
 #include <vector>
+#include <algorithm>
 #include <cstdlib>
 #include <set>
 
@@ -543,6 +544,17 @@ public:
             m_request.get_compiled_model().input("hidden_states").get_partial_shape()[2].get_length());
         m_dflash_draft = true;
         m_dflash_candidate_position_offset = candidate_position_offset;
+        // On GPU hidden_states is a device tensor, see _get_dflash_hidden_state_input().
+        const std::vector<std::string> execution_devices =
+            m_request.get_compiled_model().get_property(ov::execution_devices);
+        const bool all_gpu_devices =
+            !execution_devices.empty() &&
+            std::all_of(execution_devices.begin(), execution_devices.end(), [](const std::string& device) {
+                return device.find("GPU") != std::string::npos;
+            });
+        if (all_gpu_devices) {
+            m_dflash_remote_context = m_request.get_compiled_model().get_context();
+        }
     }
 
     void set_inputs_embedder(const std::shared_ptr<InputsEmbedder>& inputs_embedder) {
@@ -669,11 +681,12 @@ public:
         size_t hidden_state_size = m_has_next_hidden_states_output && m_hidden_state_input_size ? m_hidden_state_input_size
                                                                                                 : hidden_size;
         ov::Tensor hidden_state_input = m_dflash_draft
-                                            ? _make_zeroed_hidden_state_input(total_num_tokens, m_dflash_hidden_state_size)
+                                            ? _get_dflash_hidden_state_input(total_num_tokens)
                                             : _prepare_hidden_state_input(total_num_tokens, hidden_state_size);
 
+        // A DFlash draft fills its rows with tensor copies: on GPU they are in device memory, which has no host pointer.
         float* hidden_state_data = nullptr;
-        if (hidden_state_input) {
+        if (hidden_state_input && !m_dflash_draft) {
             hidden_state_data = hidden_state_input.data<float>();
         }
 
@@ -1299,10 +1312,31 @@ private:
     bool m_dflash_draft = false;
     size_t m_dflash_candidate_position_offset = 1;
     size_t m_dflash_hidden_state_size = 0;
+    // The hidden_states input of a DFlash draft and, on GPU, the context its memory comes from.
+    ov::RemoteContext m_dflash_remote_context;
+    ov::Tensor m_dflash_hidden_state_input;
+
+    // Returns the hidden_states input of a DFlash draft step of `total_num_tokens` rows. The runner keeps one
+    // tensor for all its steps, which grows to the largest step and never shrinks, as an input buffer of the
+    // plugin does: a step neither allocates nor zero-fills a tensor of all its rows. On GPU it is a device tensor,
+    // so the target's rows are copied to the device once and the plugin reads the tensor as is, instead of a host
+    // copy that the plugin then uploads. The rows hold what earlier steps left: _fill_dflash_draft_rows() writes
+    // every row of the step.
+    ov::Tensor _get_dflash_hidden_state_input(size_t total_num_tokens) {
+        const ov::Shape shape{total_num_tokens, 1, m_dflash_hidden_state_size};
+        if (m_dflash_hidden_state_input) {
+            m_dflash_hidden_state_input.set_shape(shape);
+        } else {
+            m_dflash_hidden_state_input = m_dflash_remote_context
+                                              ? m_dflash_remote_context.create_tensor(ov::element::f32, shape)
+                                              : ov::Tensor(ov::element::f32, shape);
+        }
+        return m_dflash_hidden_state_input;
+    }
 
     // Fills the rows of one DFlash draft window starting at `first_row`: the request's stored target hidden
     // states go to the leading rows (token type 0) and the rest is the block (token type 1, hidden state
-    // left zero). `token_type_ids_data` points at the window's first row. Returns the number of block rows
+    // zero). `token_type_ids_data` points at the window's first row. Returns the number of block rows
     // after the first `candidate_position_offset` ones; they are the window's last rows, so the gather keeps
     // them, and a window cut before them has none.
     size_t _fill_dflash_draft_rows(uint64_t request_id,
@@ -1320,6 +1354,13 @@ private:
         std::fill_n(token_type_ids_data + context_rows, block_rows, 1);
         if (context_rows > 0) {
             _copy_roi_between_tensors(target_hidden_states, 0, context_rows, hidden_state_input, first_row);
+        }
+        if (block_rows > 0) {
+            _copy_roi_between_tensors(_make_zeroed_hidden_state_input(block_rows, m_dflash_hidden_state_size),
+                                      0,
+                                      block_rows,
+                                      hidden_state_input,
+                                      first_row + context_rows);
         }
         const size_t first_candidate = context_rows + m_dflash_candidate_position_offset;
         return num_scheduled_tokens > first_candidate ? num_scheduled_tokens - first_candidate : 0;
