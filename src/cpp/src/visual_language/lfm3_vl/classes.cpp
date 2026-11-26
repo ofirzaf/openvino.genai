@@ -131,7 +131,9 @@ InputsEmbedderLFM3VL::InputsEmbedderLFM3VL(const VLMConfig& vlm_config,
                                          const Tokenizer& tokenizer,
                                          const std::string& device,
                                          const ov::AnyMap device_config)
-    : IInputsEmbedder(vlm_config, model_dir, tokenizer, device, device_config) {}
+    : IInputsEmbedder(vlm_config, model_dir, tokenizer, device, device_config) {
+    init_inkling2();
+}
 
 InputsEmbedderLFM3VL::InputsEmbedderLFM3VL(const VLMConfig& vlm_config,
                                          const ModelsMap& models_map,
@@ -139,9 +141,21 @@ InputsEmbedderLFM3VL::InputsEmbedderLFM3VL(const VLMConfig& vlm_config,
                                          const std::filesystem::path& config_dir_path,
                                          const std::string& device,
                                          const ov::AnyMap device_config)
-    : IInputsEmbedder(vlm_config, models_map, tokenizer, config_dir_path, device, device_config) {}
+    : IInputsEmbedder(vlm_config, models_map, tokenizer, config_dir_path, device, device_config) {
+    init_inkling2();
+}
+
+void InputsEmbedderLFM3VL::init_inkling2() {
+    // Inkling 2 exports the same three models as LFM3-VL, so this class serves its text prompts as it is.
+    if (m_vlm_config.model_type == VLMModelType::INKLING2_LOOP) {
+        set_chat_template_patcher(m_tokenizer, utils::patch_chat_template_inkling2);
+    }
+}
 
 std::vector<EncodedImage> InputsEmbedderLFM3VL::encode_images(const std::vector<ov::Tensor>& images) {
+    // Its image preprocessing and image layout in the prompt differ from LFM3-VL.
+    OPENVINO_ASSERT(m_vlm_config.model_type != VLMModelType::INKLING2_LOOP || images.empty(),
+                    "Image inputs are not supported for Inkling 2 yet.");
     const auto single_images = to_single_image_tensors(images);
     std::vector<EncodedImage> encoded_images;
     encoded_images.reserve(single_images.size());
@@ -153,6 +167,8 @@ std::vector<EncodedImage> InputsEmbedderLFM3VL::encode_images(const std::vector<
 
 std::vector<EncodedVideo> InputsEmbedderLFM3VL::encode_videos(const std::vector<ov::Tensor>& videos,
                                                            const std::vector<VideoMetadata>& videos_metadata) {
+    OPENVINO_ASSERT(m_vlm_config.model_type != VLMModelType::INKLING2_LOOP || videos.empty(),
+                    "Inkling 2 does not accept video inputs.");
     OPENVINO_ASSERT(videos_metadata.empty() || videos_metadata.size() == videos.size(),
                     "Number of videos and video metadata entries must match.");
     std::vector<EncodedVideo> encoded_videos;

@@ -45,6 +45,7 @@ VLMModelType to_vlm_model_type(const std::string& value) {
         {"lfm3_vl", VLMModelType::LFM3_VL},
         {"lfm3_omni", VLMModelType::LFM3_OMNI},
         {"molmo2", VLMModelType::MOLMO2},
+        {"inkling2_loop", VLMModelType::INKLING2_LOOP},
     };
 
     auto it = model_types_map.find(value);

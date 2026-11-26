@@ -1329,6 +1329,14 @@ std::string patch_chat_template_undefined_tests(const std::string& chat_template
     return std::regex_replace(chat_template, var_is_undefined, "not $1 is defined");
 }
 
+std::string patch_chat_template_inkling2(const std::string& chat_template) {
+    // `{%- set spec = { ..., "type": (...), } -%}`: drop the comma before the closing brace of the statement
+    const std::regex trailing_comma{R"(,(\s*\}\s*-?%\}))"};
+    // `{%- set num = eff | float -%}`: `eff` is not a string in this branch of the template
+    const std::regex float_filter{R"(\s*\|\s*float\b)"};
+    return std::regex_replace(std::regex_replace(chat_template, trailing_comma, "$1"), float_filter, "");
+}
+
 }  // namespace utils
 }  // namespace genai
 }  // namespace ov

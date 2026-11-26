@@ -67,6 +67,10 @@ public:
 protected:
     /// @brief Prompt ids of the last get_inputs_embeds() call.
     ov::Tensor m_last_input_ids;
+
+private:
+    /// @brief Setup for Inkling 2 (inkling2_loop), which reuses this class for text prompts.
+    void init_inkling2();
 };
 
 }  // namespace ov::genai

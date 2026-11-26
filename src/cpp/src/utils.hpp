@@ -515,6 +515,14 @@ std::string patch_chat_template_multiline_strings(const std::string& chat_templa
  */
 std::string patch_chat_template_undefined_tests(const std::string& chat_template);
 
+/**
+ * @brief Rewrites the two constructs of the Inkling 2 chat template that minja does not parse or run: a trailing
+ * comma in a dict literal that closes a `set` statement, and the `float` filter (applied there to a value that is
+ * a number already). The template text that is rendered is unchanged otherwise. Tool declarations and tool calls
+ * still fail in minja: they call `tojson` with `sort_keys` and `separators`.
+ */
+std::string patch_chat_template_inkling2(const std::string& chat_template);
+
 }  // namespace utils
 }  // namespace genai
 }  // namespace ov

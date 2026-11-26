@@ -105,6 +105,20 @@ void prepare_model_for_paged_attention(const std::shared_ptr<ov::Model>& model,
         .run_on_model(model);
     model->validate_nodes_and_infer_types();
     utils::apply_gather_before_matmul_transformation(model);
+
+    // A relative position bias table (PagedAttention input 11 of rank 3, one row per token) is indexed by the
+    // distance between a query and a key, which the kernels take from the position of the key in the cache.
+    // So cached tokens can't be evicted or skipped.
+    const auto ops = model->get_ops();
+    const bool has_relative_bias_table = std::any_of(ops.begin(), ops.end(), [](const auto& op) {
+        return std::string(op->get_type_name()) == "PagedAttentionExtension" && op->get_input_size() > 11 &&
+               op->get_input_partial_shape(11).rank().is_static() && op->get_input_partial_shape(11).size() == 3;
+    });
+    OPENVINO_ASSERT(!has_relative_bias_table ||
+                        (!scheduler_config.use_cache_eviction && !scheduler_config.use_sparse_attention),
+                    "SchedulerConfig use_cache_eviction and use_sparse_attention must be false for models with a "
+                    "relative position bias table, got use_cache_eviction=", scheduler_config.use_cache_eviction,
+                    ", use_sparse_attention=", scheduler_config.use_sparse_attention);
 }
 
 ContinuousBatchingPipeline::ContinuousBatchingImpl::ContinuousBatchingImpl(

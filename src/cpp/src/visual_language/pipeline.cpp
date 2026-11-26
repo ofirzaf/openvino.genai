@@ -1235,11 +1235,19 @@ private:
     }
 };
 
-bool requires_sdpa(const std::filesystem::path& models_dir) {
+// Inkling 2 attention has a relative position bias and a sink per token. Only the GPU plugin runs them in
+// PagedAttention, and it does not run them in the stateful form; the other plugins run the stateful form only.
+bool inkling2_requires_paged_attention(const std::filesystem::path& models_dir, const std::string& device) {
+    const auto vlm_config = utils::from_config_json_if_exists<VLMConfig>(models_dir, "config.json");
+    return vlm_config.model_type == VLMModelType::INKLING2_LOOP && device.find("GPU") != std::string::npos;
+}
+
+bool requires_sdpa(const std::filesystem::path& models_dir, const std::string& device) {
     // Force models to use SDPA backend by default until PA is supported. An explicit PA request still gets PA.
     // LFM3-Omni speech output is decoded in the stateful language model loop, which only SDPA provides.
     const auto vlm_config = utils::from_config_json_if_exists<VLMConfig>(models_dir, "config.json");
-    return vlm_config.model_type == VLMModelType::LFM3_OMNI;
+    return vlm_config.model_type == VLMModelType::LFM3_OMNI ||
+           (vlm_config.model_type == VLMModelType::INKLING2_LOOP && !inkling2_requires_paged_attention(models_dir, device));
 }
 
 VLMPipeline::VLMPipeline(
@@ -1267,7 +1275,7 @@ VLMPipeline::VLMPipeline(
         if (utils::explicitly_requires_paged_attention(user_properties)) {
             auto [plugin_properties, scheduler_config] = utils::extract_scheduler_config(properties, utils::get_latency_oriented_scheduler_config());
             m_pimpl = std::make_shared<VLMContinuousBatchingAdapter>(language_model, models_dir, scheduler_config, device, plugin_properties);
-        } else if (attention_backend == PA_BACKEND && !requires_sdpa(models_dir)) {
+        } else if (attention_backend == PA_BACKEND && !requires_sdpa(models_dir, device)) {
             // try to call CB adapter one more time, but with safe guard to silent exception
             try {
                 auto [plugin_properties, scheduler_config] = utils::extract_scheduler_config(properties, utils::get_latency_oriented_scheduler_config());
@@ -1277,6 +1285,9 @@ VLMPipeline::VLMPipeline(
                 m_pimpl = std::make_shared<VLMContinuousBatchingAdapter>(language_model, models_dir, scheduler_config, device, plugin_properties);
 #endif
             } catch (const ov::Exception& exception) {
+                if (inkling2_requires_paged_attention(models_dir, device)) {
+                    throw;  // the SDPA backend can't run this model on this device, so its error would hide this one
+                }
                 utils::log_paged_attention_fallback(exception);
                 language_model = utils::singleton_core().read_model(language_model_path, {}, properties);
             }
@@ -1319,7 +1330,7 @@ VLMPipeline::VLMPipeline(
         if (utils::explicitly_requires_paged_attention(user_properties)) {
             auto [plugin_properties, scheduler_config] = utils::extract_scheduler_config(properties, utils::get_latency_oriented_scheduler_config());
             m_pimpl = std::make_shared<VLMContinuousBatchingAdapter>(language_model, models_map, tokenizer, config_dir_path, scheduler_config, device, plugin_properties, generation_config);
-        } else if (attention_backend == PA_BACKEND && !requires_sdpa(config_dir_path)) {
+        } else if (attention_backend == PA_BACKEND && !requires_sdpa(config_dir_path, device)) {
             // try to call CB adapter one more time, but with safe guard to silent exception
             try {
                 auto [plugin_properties, scheduler_config] = utils::extract_scheduler_config(properties, utils::get_latency_oriented_scheduler_config());
@@ -1329,6 +1340,9 @@ VLMPipeline::VLMPipeline(
                 m_pimpl = std::make_shared<VLMContinuousBatchingAdapter>(language_model, models_map, tokenizer, config_dir_path, scheduler_config, device, plugin_properties, generation_config);
     #endif
             } catch (const ov::Exception& exception) {
+                if (inkling2_requires_paged_attention(config_dir_path, device)) {
+                    throw;  // the SDPA backend can't run this model on this device, so its error would hide this one
+                }
                 utils::log_paged_attention_fallback(exception);
                 language_model = utils::singleton_core().read_model(model_str, weights);
             }

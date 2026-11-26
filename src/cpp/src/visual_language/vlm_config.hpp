@@ -43,6 +43,7 @@ enum class VLMModelType {
     LFM3_VL,
     LFM3_OMNI,
     MOLMO2,
+    INKLING2_LOOP,
 };
 
 /// @brief A Configuration class passed to VLMPipeline and used to
