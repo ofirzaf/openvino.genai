@@ -65,7 +65,9 @@ GenerationConfig ContinuousBatchingPipeline::SpeculativeDecodingImpl::make_draft
 }
 
 std::pair<ov::genai::SchedulerConfig, ov::genai::SchedulerConfig>
-ContinuousBatchingPipeline::SpeculativeDecodingImpl::init_speculative_models(const ov::genai::ModelDesc& main_model_desc, const ov::genai::ModelDesc& draft_model_desc) {
+ContinuousBatchingPipeline::SpeculativeDecodingImpl::init_speculative_models(const ov::genai::ModelDesc& main_model_desc,
+                                                                             const ov::genai::ModelDesc& draft_model_desc,
+                                                                             bool allow_kv_cache_write) {
     auto main_model = main_model_desc.model;
     auto draft_model = draft_model_desc.model;
     OPENVINO_ASSERT(main_model != nullptr, "Main model cannot be null");
@@ -90,7 +92,10 @@ ContinuousBatchingPipeline::SpeculativeDecodingImpl::init_speculative_models(con
                                    allow_score_aggregation,
                                    allow_cache_rotation,
                                    allow_xattention,
-                                   allow_adaptive_rkv).run_on_model(draft_model);
+                                   allow_adaptive_rkv,
+                                   false,
+                                   false,
+                                   allow_kv_cache_write).run_on_model(draft_model);
 
     utils::apply_gather_before_matmul_transformation(main_model);
     utils::apply_gather_before_matmul_transformation(draft_model);

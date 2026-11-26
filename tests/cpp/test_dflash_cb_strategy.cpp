@@ -425,6 +425,11 @@ std::shared_ptr<ov::Model> make_dflash_draft_inputs_model() {
     add_input("token_type_ids", ov::element::i64, ov::PartialShape{-1, 1});
     add_input("hidden_states", ov::element::f32, ov::PartialShape{-1, 1, static_cast<int64_t>(HIDDEN_SIZE)});
     add_input("sampled_tokens_indices", ov::element::i64, ov::PartialShape{-1});
+    add_input("context_kv_position_ids", ov::element::i64, ov::PartialShape{-1});
+    for (const char* name : {"kv_write_past_lens", "kv_write_subsequence_begins", "kv_write_block_indices",
+                             "kv_write_block_indices_begins"}) {
+        add_input(name, ov::element::i32, ov::PartialShape{-1});
+    }
     auto logits = ov::op::v0::Constant::create(ov::element::f32, {1, 1, 8}, {0.0f});
     logits->output(0).get_tensor().set_names({"logits"});
     return std::make_shared<ov::Model>(ov::OutputVector{logits}, params);

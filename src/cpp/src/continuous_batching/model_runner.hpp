@@ -479,7 +479,8 @@ public:
         for (const auto& input : compiled_model.inputs()) {
             for (const auto& name : input.get_names()) {
                 const std::string marker = "block_indices_begins";
-                if (name.size() > marker.size() &&
+                // kv_write_block_indices_begins is an input of PagedKVCacheWrite (DFlash draft), not a paging group
+                if (name.size() > marker.size() && name.rfind("kv_write_", 0) != 0 &&
                     name.compare(name.size() - marker.size(), marker.size(), marker) == 0) {
                     std::string prefix = name.substr(0, name.size() - marker.size());
                     m_linear_attention_paging_groups.push_back({prefix, {}, {}, {}, {}});
@@ -516,12 +517,18 @@ public:
     void enable_mtp_draft_positions(bool on) { m_mtp_draft_positions = on; }
 
     // DFlash draft: each scheduled request forwards [target hidden-state rows ; seed + mask block]. The target
-    // rows come from set_initial_hidden_state() and get token type 0; the remaining scheduled rows are the block
-    // and get token type 1. The block rows after the first `candidate_position_offset` ones are gathered.
+    // rows come from set_initial_hidden_state() and are the context rows; the remaining scheduled rows are the
+    // block. See _forward_dflash_draft.
     void enable_dflash_draft(size_t candidate_position_offset) {
+        const auto compiled_model = m_request.get_compiled_model();
+        for (const char* name : {"context_kv_position_ids", "kv_write_past_lens", "token_type_ids", "sampled_tokens_indices"}) {
+            OPENVINO_ASSERT(std::any_of(compiled_model.inputs().begin(), compiled_model.inputs().end(),
+                                        [&](const ov::Output<const ov::Node>& in) { return in.get_names().count(name) > 0; }),
+                            "DFlash draft model has no '", name, "' input.");
+        }
         // a token-input draft gives the runner no embedding width, so hidden_states is sized from the model
         m_dflash_hidden_state_size = static_cast<size_t>(
-            m_request.get_compiled_model().input("hidden_states").get_partial_shape()[2].get_length());
+            compiled_model.input("hidden_states").get_partial_shape()[2].get_length());
         m_dflash_draft = true;
         m_dflash_candidate_position_offset = candidate_position_offset;
     }
@@ -581,6 +588,10 @@ public:
             sequence_groups[0]->get_sequence_group_type() == SequenceGroupType::EMBEDDINGS &&
             _has_missing_generated_embeddings(sequence_groups, scheduler_output)) {
             append_embeddings(sequence_groups, scheduler_output);
+        }
+
+        if (m_dflash_draft) {
+            return _forward_dflash_draft(sequence_groups, scheduler_output);
         }
 
         size_t batch_size_in_sequences = 0;
@@ -646,9 +657,7 @@ public:
         ov::Tensor score_aggregation_window = _get_or_resize_tensor(m_cached_score_aggregation_window, "score_aggregation_window",
             {batch_size_in_sequences}, ov::element::i32);
 
-        ov::Tensor hidden_state_input = m_dflash_draft
-                                            ? _make_zeroed_hidden_state_input(total_num_tokens, m_dflash_hidden_state_size)
-                                            : _prepare_hidden_state_input(total_num_tokens, hidden_size);
+        ov::Tensor hidden_state_input = _prepare_hidden_state_input(total_num_tokens, hidden_size);
         float* hidden_state_data = nullptr;
         if (hidden_state_input) {
             hidden_state_data = hidden_state_input.data<float>();
@@ -663,9 +672,6 @@ public:
         float *inputs_embeds_data = nullptr;
         int64_t *input_ids_data = nullptr;
         int64_t *token_type_ids_data = nullptr;
-        // DFlash sets token types for token and embedding inputs alike, so it does not share the VLM cursor
-        // token_type_ids_data; each request writes at its first row, dflash_token_type_ids_data + current_token_idx.
-        int64_t *dflash_token_type_ids_data = m_dflash_draft ? token_type_ids.data<int64_t>() : nullptr;
 
         ov::Tensor deepstack_visual_embeds;
         ov::Tensor visual_pos_masks;
@@ -870,12 +876,6 @@ public:
                             }
                         }
                     }
-                } else if (m_dflash_draft) {
-                    tokens_to_sample_per_sequence = _fill_dflash_draft_rows(sequence_group->get_request_id(),
-                                                                            num_scheduled_tokens,
-                                                                            current_token_idx,
-                                                                            hidden_state_input,
-                                                                            dflash_token_type_ids_data + current_token_idx);
                 }
                 for (size_t token_id = 0, position_id = group_position_id; token_id < num_scheduled_tokens; ++token_id, ++position_id, ++gathering_current_index) {
                     // compute token for current sequence
@@ -1268,29 +1268,153 @@ private:
     size_t m_dflash_candidate_position_offset = 1;
     size_t m_dflash_hidden_state_size = 0;
 
-    // Fills the rows of one DFlash draft window starting at `first_row`: the request's stored target hidden
-    // states go to the leading rows (token type 0) and the rest is the block (token type 1, hidden state
-    // left zero). `token_type_ids_data` points at the window's first row. Returns the number of block rows
-    // after the first `candidate_position_offset` ones; they are the window's last rows, so the gather keeps
-    // them, and a window cut before them has none.
-    size_t _fill_dflash_draft_rows(uint64_t request_id,
-                                   size_t num_scheduled_tokens,
-                                   size_t first_row,
-                                   const ov::Tensor& hidden_state_input,
-                                   int64_t* token_type_ids_data) {
-        const auto it = m_initial_hidden_states.find(request_id);
-        const ov::Tensor target_hidden_states = it != m_initial_hidden_states.end() ? it->second : ov::Tensor{};
-        const size_t num_target_rows = target_hidden_states ? target_hidden_states.get_shape()[0] : 0;
-        const size_t context_rows = std::min(num_scheduled_tokens, num_target_rows);
-        const size_t block_rows = num_scheduled_tokens - context_rows;
-
-        std::fill_n(token_type_ids_data, context_rows, 0);
-        std::fill_n(token_type_ids_data + context_rows, block_rows, 1);
-        if (context_rows > 0) {
-            _copy_roi_between_tensors(target_hidden_states, 0, context_rows, hidden_state_input, first_row);
+    // One DFlash draft forward. Each scheduled request forwards [context rows ; block rows]: the context rows are
+    // the request's stored target hidden states, and the rest of the scheduled rows is the block. The model takes
+    // them as two row lists: the context rows go to PagedKVCacheWrite (hidden_states, context_kv_position_ids,
+    // kv_write_*) and the block rows to PagedAttention (input_ids or inputs_embeds, position_ids, token_type_ids
+    // and PA's own inputs). Each list holds only the requests that have rows for it. The logits are gathered at
+    // the block rows after the first `candidate_position_offset` ones.
+    ov::Tensor _forward_dflash_draft(const std::vector<SequenceGroup::Ptr>& sequence_groups,
+                                     const ContinuousBatchingScheduler::Output& scheduler_output) {
+        // Features of the common forward that this path does not implement must stay off for the draft.
+        OPENVINO_ASSERT(!m_use_per_layer_kv_block_indices && !m_collect_attention_scores && !m_is_aggregate_attention_scores &&
+                            !m_is_use_rotation_inputs && !m_is_use_xattention_inputs && !m_is_use_adaptive_rkv &&
+                            m_linear_attention_paging_groups.empty() && !_is_hs_export(),
+                        "DFlash draft does not support per-layer block indices, cache eviction, cache rotation, XAttention, "
+                        "adaptive RKV, linear-attention paging or hidden-state export.");
+        OPENVINO_ASSERT(!scheduler_output.get_kv_paged_attention_global_data().apply_sparse_attention_mask,
+                        "DFlash draft does not support sparse attention.");
+        struct Rows {
+            SequenceGroup::Ptr group;
+            Sequence::CPtr sequence;
+            ov::Tensor target_hidden_states;
+            size_t processed;
+            size_t context;
+            size_t block;
+        };
+        std::vector<Rows> rows;
+        size_t total_context = 0, total_block = 0, num_writer = 0, num_pa = 0, max_context_len_val = 0;
+        size_t writer_blocks = 0, pa_blocks = 0;
+        for (size_t seq_group_id : scheduler_output.m_scheduled_sequence_groups_ids) {
+            const SequenceGroup::Ptr& sequence_group = sequence_groups[seq_group_id];
+            const auto it = m_initial_hidden_states.find(sequence_group->get_request_id());
+            const ov::Tensor target_hidden_states = it != m_initial_hidden_states.end() ? it->second : ov::Tensor{};
+            const size_t num_target_rows = target_hidden_states ? target_hidden_states.get_shape()[0] : 0;
+            const size_t num_scheduled_tokens = sequence_group->get_num_scheduled_tokens();
+            OPENVINO_ASSERT(sequence_group->get_num_evicted_tokens() == 0, "DFlash draft does not support cache eviction.");
+            max_context_len_val = std::max(max_context_len_val, sequence_group->get_context_len());
+            for (const auto& sequence : sequence_group->get_running_sequences()) {
+                Rows r{sequence_group, sequence, target_hidden_states, sequence_group->get_num_processed_tokens(),
+                       std::min(num_scheduled_tokens, num_target_rows), 0};
+                r.block = num_scheduled_tokens - r.context;
+                const size_t num_blocks = scheduler_output.get_kv_block_tables(sequence->get_id())[0].size();
+                total_context += r.context;
+                total_block += r.block;
+                num_writer += r.context > 0;
+                num_pa += r.block > 0;
+                writer_blocks += r.context > 0 ? num_blocks : 0;
+                pa_blocks += r.block > 0 ? num_blocks : 0;
+                rows.push_back(std::move(r));
+            }
         }
-        const size_t first_candidate = context_rows + m_dflash_candidate_position_offset;
-        return num_scheduled_tokens > first_candidate ? num_scheduled_tokens - first_candidate : 0;
+
+        auto input = [&](const std::string& name, const ov::Shape& shape) {
+            ov::Tensor tensor = m_request.get_tensor(name);
+            tensor.set_shape(shape);
+            return tensor;
+        };
+        const bool token_input = sequence_groups[0]->get_sequence_group_type() == SequenceGroupType::TOKENS;
+        const size_t embeds_size = token_input ? 0 : sequence_groups[0]->get_hidden_size();
+
+        // Context rows: the cache write
+        ov::Tensor hidden_states(ov::element::f32, {total_context, 1, m_dflash_hidden_state_size});
+        int64_t* context_positions = input("context_kv_position_ids", {total_context}).data<int64_t>();
+        int32_t* kv_write_past_lens = input("kv_write_past_lens", {num_writer}).data<int32_t>();
+        int32_t* kv_write_subsequence_begins = input("kv_write_subsequence_begins", {num_writer + 1}).data<int32_t>();
+        int32_t* kv_write_block_indices = input("kv_write_block_indices", {writer_blocks}).data<int32_t>();
+        int32_t* kv_write_block_indices_begins = input("kv_write_block_indices_begins", {num_writer + 1}).data<int32_t>();
+        // Block rows: attention
+        int64_t* input_ids = token_input ? input("input_ids", {total_block}).data<int64_t>() : nullptr;
+        float* inputs_embeds = token_input ? nullptr : input("inputs_embeds", {total_block, embeds_size}).data<float>();
+        int64_t* positions = input("position_ids", {total_block}).data<int64_t>();
+        int64_t* token_type_ids = input("token_type_ids", {total_block, 1}).data<int64_t>();
+        int32_t* past_lens = input("past_lens", {num_pa}).data<int32_t>();
+        int32_t* subsequence_begins = input("subsequence_begins", {num_pa + 1}).data<int32_t>();
+        int32_t* block_indices = input("block_indices", {pa_blocks}).data<int32_t>();
+        int32_t* block_indices_begins = input("block_indices_begins", {num_pa + 1}).data<int32_t>();
+        input("max_context_len", {}).data<int32_t>()[0] = static_cast<int32_t>(max_context_len_val);
+
+        kv_write_subsequence_begins[0] = kv_write_block_indices_begins[0] = 0;
+        subsequence_begins[0] = block_indices_begins[0] = 0;
+        std::vector<int64_t> gather_indices;
+        size_t context_row = 0, block_row = 0;
+        for (const Rows& r : rows) {
+            const auto& block_table = scheduler_output.get_kv_block_tables(r.sequence->get_id())[0];
+            const auto write_block_table = [&](int32_t*& dst) {
+                for (const auto& block : block_table) {
+                    *dst++ = block->get_index();
+                }
+            };
+            if (r.context > 0) {
+                _copy_roi_between_tensors(r.target_hidden_states, 0, r.context, hidden_states, context_row);
+                for (size_t i = 0; i < r.context; ++i) {
+                    context_positions[context_row + i] = static_cast<int64_t>(r.processed + i);
+                }
+                *kv_write_past_lens++ = static_cast<int32_t>(r.processed);
+                kv_write_subsequence_begins[1] = kv_write_subsequence_begins[0] + static_cast<int32_t>(r.context);
+                kv_write_block_indices_begins[1] = kv_write_block_indices_begins[0] + static_cast<int32_t>(block_table.size());
+                ++kv_write_subsequence_begins;
+                ++kv_write_block_indices_begins;
+                write_block_table(kv_write_block_indices);
+                context_row += r.context;
+            }
+
+            size_t output_seq_len = 0;
+            if (r.block > 0) {
+                const size_t prompt_len = r.group->get_prompt_len();
+                const size_t first_position = r.processed + r.context;
+                const bool gather = r.group->requires_sampling() || r.group->get_sampling_parameters().echo;
+                for (size_t j = 0; j < r.block; ++j) {
+                    const size_t position = first_position + j;
+                    if (token_input) {
+                        input_ids[block_row + j] = position < prompt_len
+                                                       ? r.group->get_prompt_ids()[position]
+                                                       : r.sequence->get_generated_ids()[position - prompt_len];
+                    } else {
+                        const float* src = position < prompt_len
+                                               ? r.group->get_input_embeds()[position].data()
+                                               : r.sequence->get_generated_ids_embeds()[position - prompt_len].data();
+                        std::copy_n(src, embeds_size, inputs_embeds + (block_row + j) * embeds_size);
+                    }
+                    positions[block_row + j] = static_cast<int64_t>(position);
+                    token_type_ids[block_row + j] = 1;
+                    if (gather && j >= m_dflash_candidate_position_offset && position + 1 >= prompt_len) {
+                        gather_indices.push_back(static_cast<int64_t>(block_row + j));
+                        ++output_seq_len;
+                    }
+                }
+                *past_lens++ = static_cast<int32_t>(first_position);
+                subsequence_begins[1] = subsequence_begins[0] + static_cast<int32_t>(r.block);
+                block_indices_begins[1] = block_indices_begins[0] + static_cast<int32_t>(block_table.size());
+                ++subsequence_begins;
+                ++block_indices_begins;
+                write_block_table(block_indices);
+                block_row += r.block;
+            }
+            r.group->set_output_seq_len(output_seq_len);
+        }
+        m_request.set_tensor("hidden_states", hidden_states);
+        ov::Tensor gather = m_request.get_tensor("sampled_tokens_indices");
+        gather.set_shape({gather_indices.size()});
+        std::copy(gather_indices.begin(), gather_indices.end(), gather.data<int64_t>());
+
+        {
+            static ManualTimer timer("pure generate inference");
+            timer.start();
+            m_request.infer();
+            timer.end();
+        }
+        return m_request.get_tensor("logits");
     }
 
     // Hidden state flags and helpers

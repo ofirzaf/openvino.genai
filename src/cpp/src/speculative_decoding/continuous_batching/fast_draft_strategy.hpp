@@ -202,7 +202,10 @@ protected:
     }
     bool is_requests_empty();
     std::vector<SequenceGroup::Ptr> get_awaiting_requests();
-    std::pair<ov::genai::SchedulerConfig, ov::genai::SchedulerConfig> init_speculative_models(const ov::genai::ModelDesc& main_model_desc, const ov::genai::ModelDesc& draft_model_desc);
+    // allow_kv_cache_write: convert the draft with SDPAToPagedAttention's KV cache write option (DFlash drafts).
+    std::pair<ov::genai::SchedulerConfig, ov::genai::SchedulerConfig> init_speculative_models(const ov::genai::ModelDesc& main_model_desc,
+                                                                                              const ov::genai::ModelDesc& draft_model_desc,
+                                                                                              bool allow_kv_cache_write = false);
 public:
     template<class Impl>
     friend std::vector<EncodedGenerationResult> generate_common(

@@ -245,6 +245,12 @@ std::shared_ptr<ov::Model> create_dummy_dflash_draft_model() {
     add_input("token_type_ids", ov::element::i64, ov::PartialShape{-1, 1});
     add_input("hidden_states", ov::element::f32, ov::PartialShape{-1, 1, static_cast<int64_t>(DFLASH_HIDDEN_SIZE)});
     add_input("sampled_tokens_indices", ov::element::i64, ov::PartialShape{-1});
+    // the context rows, for PagedKVCacheWrite
+    add_input("context_kv_position_ids", ov::element::i64, ov::PartialShape::dynamic(1));
+    for (const char* name : {"kv_write_past_lens", "kv_write_subsequence_begins", "kv_write_block_indices",
+                             "kv_write_block_indices_begins"}) {
+        add_input(name, ov::element::i32, ov::PartialShape::dynamic(1));
+    }
 
     auto logits = ov::op::v0::Constant::create(ov::element::f32, {1, 1, 8}, {0.0f});
     logits->output(0).get_tensor().set_names({"logits"});
@@ -293,8 +299,19 @@ TEST(TestModelRunnerDFlashDraft, deepspec_gathers_from_the_seed_row) {
     const auto seq_id = group->get_running_sequences()[0]->get_id();
     std::ignore = runner.forward({group}, make_output_for_single_sequence(seq_id, 11, BlocksPerLayer{std::make_shared<CacheBlock>(0)}));
 
-    EXPECT_EQ(tensor_values<int64_t>(runner.get_infer_request().get_tensor("sampled_tokens_indices")),
-              (std::vector<int64_t>{8, 9, 10}));
+    auto ireq = runner.get_infer_request();
+    // the block rows are the only rows of the PA inputs, and every one of them is a candidate
+    EXPECT_EQ(tensor_values<int64_t>(ireq.get_tensor("sampled_tokens_indices")), (std::vector<int64_t>{0, 1, 2}));
+    EXPECT_EQ(tensor_values<int64_t>(ireq.get_tensor("input_ids")), (std::vector<int64_t>{7, 99, 99}));
+    EXPECT_EQ(tensor_values<int64_t>(ireq.get_tensor("position_ids")), (std::vector<int64_t>{8, 9, 10}));
+    EXPECT_EQ(tensor_values<int64_t>(ireq.get_tensor("token_type_ids")), (std::vector<int64_t>{1, 1, 1}));
+    EXPECT_EQ(tensor_to_i32_vector(ireq.get_tensor("past_lens")), (std::vector<int32_t>{8}));
+    EXPECT_EQ(tensor_to_i32_vector(ireq.get_tensor("subsequence_begins")), (std::vector<int32_t>{0, 3}));
+    // the context rows go to the cache write
+    EXPECT_EQ(tensor_values<int64_t>(ireq.get_tensor("context_kv_position_ids")),
+              (std::vector<int64_t>{0, 1, 2, 3, 4, 5, 6, 7}));
+    EXPECT_EQ(tensor_to_i32_vector(ireq.get_tensor("kv_write_past_lens")), (std::vector<int32_t>{0}));
+    EXPECT_EQ(tensor_to_i32_vector(ireq.get_tensor("kv_write_subsequence_begins")), (std::vector<int32_t>{0, 8}));
 }
 
 TEST(TestModelRunnerDFlashDraft, context_only_window_gathers_nothing) {
@@ -310,8 +327,14 @@ TEST(TestModelRunnerDFlashDraft, context_only_window_gathers_nothing) {
     const auto seq_id = group->get_running_sequences()[0]->get_id();
     std::ignore = runner.forward({group}, make_output_for_single_sequence(seq_id, 4, BlocksPerLayer{std::make_shared<CacheBlock>(0)}));
 
-    EXPECT_EQ(tensor_values<int64_t>(runner.get_infer_request().get_tensor("token_type_ids")), (std::vector<int64_t>{0, 0, 0, 0}));
-    EXPECT_EQ(runner.get_infer_request().get_tensor("sampled_tokens_indices").get_size(), 0);
+    auto ireq = runner.get_infer_request();
+    // no block rows: PagedAttention gets no rows and no requests, the cache write gets the 4 context rows
+    EXPECT_EQ(ireq.get_tensor("token_type_ids").get_size(), 0);
+    EXPECT_EQ(ireq.get_tensor("past_lens").get_size(), 0);
+    EXPECT_EQ(tensor_to_i32_vector(ireq.get_tensor("subsequence_begins")), (std::vector<int32_t>{0}));
+    EXPECT_EQ(tensor_to_i32_vector(ireq.get_tensor("kv_write_subsequence_begins")), (std::vector<int32_t>{0, 4}));
+    EXPECT_EQ(ireq.get_tensor("hidden_states").get_shape(), (ov::Shape{4, 1, DFLASH_HIDDEN_SIZE}));
+    EXPECT_EQ(ireq.get_tensor("sampled_tokens_indices").get_size(), 0);
     EXPECT_EQ(group->get_output_seq_len(), 0);
 }
 
@@ -335,14 +358,21 @@ TEST(TestModelRunnerDFlashDraft, batched_windows_use_their_own_rows) {
                                                            18));
 
     auto ireq = runner.get_infer_request();
-    EXPECT_EQ(tensor_values<int64_t>(ireq.get_tensor("token_type_ids")),
-              (std::vector<int64_t>{0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1}));
-    std::vector<float> expected_hidden(18 * DFLASH_HIDDEN_SIZE, 0.0f);
+    // context rows of both requests, then block rows of both requests, each in its own row list
+    std::vector<float> expected_hidden(10 * DFLASH_HIDDEN_SIZE, 0.0f);
     std::iota(expected_hidden.begin(), expected_hidden.begin() + 8 * DFLASH_HIDDEN_SIZE, 1.0f);
-    std::iota(expected_hidden.begin() + 12 * DFLASH_HIDDEN_SIZE, expected_hidden.begin() + 14 * DFLASH_HIDDEN_SIZE, 1.0f);
+    std::iota(expected_hidden.begin() + 8 * DFLASH_HIDDEN_SIZE, expected_hidden.end(), 1.0f);
     EXPECT_EQ(tensor_values<float>(ireq.get_tensor("hidden_states")), expected_hidden);
-    EXPECT_EQ(tensor_values<int64_t>(ireq.get_tensor("sampled_tokens_indices")),
-              (std::vector<int64_t>{9, 10, 11, 15, 16, 17}));
+    EXPECT_EQ(tensor_values<int64_t>(ireq.get_tensor("context_kv_position_ids")),
+              (std::vector<int64_t>{0, 1, 2, 3, 4, 5, 6, 7, 0, 1}));
+    EXPECT_EQ(tensor_to_i32_vector(ireq.get_tensor("kv_write_past_lens")), (std::vector<int32_t>{0, 0}));
+    EXPECT_EQ(tensor_to_i32_vector(ireq.get_tensor("kv_write_subsequence_begins")), (std::vector<int32_t>{0, 8, 10}));
+    EXPECT_EQ(tensor_values<int64_t>(ireq.get_tensor("input_ids")), (std::vector<int64_t>{7, 99, 99, 99, 7, 99, 99, 99}));
+    EXPECT_EQ(tensor_values<int64_t>(ireq.get_tensor("position_ids")), (std::vector<int64_t>{8, 9, 10, 11, 2, 3, 4, 5}));
+    EXPECT_EQ(tensor_values<int64_t>(ireq.get_tensor("token_type_ids")), (std::vector<int64_t>(8, 1)));
+    EXPECT_EQ(tensor_to_i32_vector(ireq.get_tensor("past_lens")), (std::vector<int32_t>{8, 2}));
+    EXPECT_EQ(tensor_to_i32_vector(ireq.get_tensor("subsequence_begins")), (std::vector<int32_t>{0, 4, 8}));
+    EXPECT_EQ(tensor_values<int64_t>(ireq.get_tensor("sampled_tokens_indices")), (std::vector<int64_t>{1, 2, 3, 5, 6, 7}));
     EXPECT_EQ(first->get_output_seq_len(), 3);
     EXPECT_EQ(second->get_output_seq_len(), 3);
 }

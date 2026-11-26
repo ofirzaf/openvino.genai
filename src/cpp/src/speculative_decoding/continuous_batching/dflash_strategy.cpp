@@ -95,7 +95,12 @@ ContinuousBatchingPipeline::DFlashDecodingImpl::DFlashDecodingImpl(
         utils::dflash::attach_target_lm_head_to_draft(main_model, draft_model);
     }
 
-    auto [main_scheduler_config, draft_scheduler_config] = init_speculative_models(main_model_desc, draft_model_desc);
+    // The draft's context rows have keys and values only: PagedKVCacheWrite stores them, PA runs on the block rows.
+    auto [main_scheduler_config, draft_scheduler_config] =
+        init_speculative_models(main_model_desc, draft_model_desc, /*allow_kv_cache_write=*/true);
+    OPENVINO_ASSERT(utils::has_input(draft_model, "kv_write_past_lens"),
+                    "DFlash draft model has no context rows separate from its block rows. It was exported for the "
+                    "token-type-only DFlash draft runner; re-export the draft with the current optimum-intel.");
     OPENVINO_ASSERT(main_scheduler_config.enable_prefix_caching == draft_scheduler_config.enable_prefix_caching,
                     "DFlash main and draft pipelines must use the same enable_prefix_caching setting.");
     // The draft candidates are read at fixed rows of the gathered logits.
